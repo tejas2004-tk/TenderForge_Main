@@ -1,0 +1,7 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+uploads/company_profiles/
+uploads/tenders/
