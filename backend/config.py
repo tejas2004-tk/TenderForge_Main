@@ -14,11 +14,11 @@ class Config:
     FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
     PORT = int(os.getenv("PORT", "5000"))
     DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    SESSION_COOKIE_SECURE = os.getenv("COOKIE_SECURE", str(not DEBUG)).lower() == "true"
     SESSION_COOKIE_NAME = os.getenv(
         "SESSION_COOKIE_NAME",
-        "tenderforge_session" if DEBUG else "__Host-tenderforge_session",
+        "__Host-tenderforge_session" if SESSION_COOKIE_SECURE else "tenderforge_session",
     )
-    SESSION_COOKIE_SECURE = os.getenv("COOKIE_SECURE", str(not DEBUG)).lower() == "true"
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = "Lax"
     MAX_TENDER_SIZE_MB = int(os.getenv("MAX_TENDER_SIZE_MB", "25"))

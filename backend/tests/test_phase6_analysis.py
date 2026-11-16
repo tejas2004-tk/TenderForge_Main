@@ -34,12 +34,29 @@ class MemoryCollection:
             if key == "$or":
                 if not any(self._matches(row, condition) for condition in value):
                     return False
-            elif isinstance(value, dict) and "$in" in value:
-                if row.get(key) not in value["$in"]:
+            elif isinstance(value, dict):
+                if "$in" in value and row.get(key) not in value["$in"]:
                     return False
-            elif isinstance(value, dict) and "$ne" in value:
-                if row.get(key) == value["$ne"]:
+                if "$ne" in value and row.get(key) == value["$ne"]:
                     return False
+                if "$exists" in value and (key in row) != bool(value["$exists"]):
+                    return False
+                if "$lt" in value:
+                    val = row.get(key)
+                    if val is None or val >= value["$lt"]:
+                        return False
+                if "$lte" in value:
+                    val = row.get(key)
+                    if val is None or val > value["$lte"]:
+                        return False
+                if "$gt" in value:
+                    val = row.get(key)
+                    if val is None or val <= value["$gt"]:
+                        return False
+                if "$gte" in value:
+                    val = row.get(key)
+                    if val is None or val < value["$gte"]:
+                        return False
             elif row.get(key) != value:
                 return False
         return True
@@ -48,12 +65,18 @@ class MemoryCollection:
         return self.Cursor(dict(row) for row in self.rows if self._matches(row, query or {}))
 
     def find_one(self, query=None, sort=None):
-        rows = self.find(query)
+        rows = list(self.find(query))
+        if sort:
+            for field, order in reversed(sort):
+                rows.sort(key=lambda r: (r.get(field) is None, r.get(field)), reverse=order < 0)
         return rows[0] if rows else None
 
-    def find_one_and_update(self, query, update, return_document=None):
-        row = next((row for row in self.rows if self._matches(row, {k: v for k, v in query.items() if k != "$or"})
-                    and ("$or" not in query or any(self._matches(row, condition) for condition in query["$or"]))), None)
+    def find_one_and_update(self, query, update, return_document=None, sort=None, **kwargs):
+        candidates = [row for row in self.rows if self._matches(row, query)]
+        if sort:
+            for field, order in reversed(sort):
+                candidates.sort(key=lambda r: (r.get(field) is None, r.get(field)), reverse=order < 0)
+        row = candidates[0] if candidates else None
         if row is not None:
             self._apply(row, update)
             return row
@@ -338,6 +361,20 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertTrue(batches.rows[0]["is_overview_batch"])
         self.assertEqual(batches.rows[0]["prompt_version"], "4")
+
+    def test_advance_drains_all_claimable_batches_in_one_call(self):
+        analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender",
+                    "file_hash": "hash", "status": "pending", "plan_ready": True,
+                    "total_batches": 2, "lease_until": None}
+        analyses = MemoryCollection([dict(analysis)])
+        batches = MemoryCollection([
+            {"_id": "first", "analysis_id": "analysis", "status": "pending", "batch_index": 0},
+            {"_id": "second", "analysis_id": "analysis", "status": "pending", "batch_index": 1},
+        ])
+        with patch.object(service, "_process_batch", side_effect=[True, True, False]) as process, \
+             patch.object(service, "_refresh_counts"):
+            service._advance(analyses.rows[0], analyses, batches, MemoryCollection(), MemoryCollection(), MemoryCollection())
+        self.assertEqual(process.call_count, 3)
 
     def _fresh_run_collections(self, status="needs_review"):
         user_id, tender_id, file_hash = "user", "tender", "hash"
@@ -692,6 +729,220 @@ class Phase6AnalysisTests(unittest.TestCase):
                     self.assertFalse(item["unconditional_eligibility_blocker"])
                 if wanted == "mandatory":
                     self.assertTrue(item["unconditional_eligibility_blocker"])
+
+    def test_requirement_status_ignores_list_shaped_model_field(self):
+        analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        evidence = "The bidder shall submit the signed undertaking."
+
+        item = service._validate_requirement(
+            {"category": "Required Documents and Certificates", "requirement_title": "Signed undertaking",
+             "description": evidence, "requirement_value": "", "mandatory": None,
+             "requirement_status": ["mandatory"], "source_page": 1,
+             "evidence_text": evidence, "extraction_status": "extracted"},
+            {1}, analysis, {"batch_index": 0}, {1: {evidence}}, 0, {1: evidence},
+        )
+
+        self.assertEqual(item["requirement_status"], "mandatory")
+        self.assertTrue(item["mandatory"])
+
+    def test_groq_output_token_truncation_and_task_splitting(self):
+        result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="length", message=SimpleNamespace(content='{"requirements": ['))],
+            usage=SimpleNamespace(prompt_tokens=50, completion_tokens=1400),
+        )
+        analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result)
+        batch["chunk_refs"] = [{"chunk_index": 1, "page_number": 1}, {"chunk_index": 2, "page_number": 2}]
+        batches.rows[0]["chunk_refs"] = list(batch["chunk_refs"])
+        chunks.rows.append({"chunk_index": 2, "page_number": 2, "text": "Page two requirement.",
+                            "user_id": "user", "tender_id": "tender", "file_hash": "hash"})
+        pages.rows.append({"page_number": 2, "part_index": 0, "complete": True, "text": "Page two requirement."})
+        requirements = MemoryCollection()
+
+        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
+            worked = service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
+
+        self.assertTrue(worked)
+        self.assertEqual(batches.rows[0]["status"], "split")
+        self.assertEqual(batches.rows[0]["finish_reason"], "length")
+        self.assertIn("Truncated task was split into smaller resumable tasks", batches.rows[0]["error_message"])
+        children = [r for r in batches.rows if r.get("parent_batch_id") == "batch"]
+        self.assertEqual(len(children), 2)
+        self.assertTrue(all(c["status"] == "pending" for c in children))
+        self.assertEqual({c["chunk_refs"][0]["page_number"] for c in children}, {1, 2})
+
+    def test_partial_findings_preserved_without_duplication(self):
+        # Truncated response containing one complete requirement before cutoff
+        partial_json = (
+            '{"overview": {"tender_title": "Function Generator"}, '
+            '"requirements": [{"category": "Technical Requirements", "requirement_title": "Frequency Range", '
+            '"description": "Frequency range 1 MHz to 20 MHz", "requirement_value": "1 MHz to 20 MHz", '
+            '"evidence_text": "The bidder shall submit certificate.", "source_page": 1}], '
+            '"truncated_tail": {"bad": '
+        )
+        result1 = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="length", message=SimpleNamespace(content=partial_json))],
+            usage=SimpleNamespace(prompt_tokens=60, completion_tokens=1400),
+        )
+        analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result1)
+        batch["chunk_refs"] = [{"chunk_index": 1, "page_number": 1}, {"chunk_index": 2, "page_number": 2}]
+        batches.rows[0]["chunk_refs"] = list(batch["chunk_refs"])
+        chunks.rows.append({"chunk_index": 2, "page_number": 2, "text": "Page two requirement.",
+                            "user_id": "user", "tender_id": "tender", "file_hash": "hash"})
+        pages.rows.append({"page_number": 2, "part_index": 0, "complete": True, "text": "Page two requirement."})
+        requirements = MemoryCollection()
+
+        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
+            service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
+
+        # 1. Partial finding was preserved and saved
+        self.assertEqual(len(requirements.rows), 1)
+        self.assertEqual(requirements.rows[0]["requirement_title"], "Frequency Range")
+        self.assertEqual(requirements.rows[0]["source_page"], 1)
+
+        # 2. Child batch for page 1 now runs and returns the same requirement with complete stop
+        child_batch = next(r for r in batches.rows if r.get("parent_batch_id") == "batch" and r["chunk_refs"][0]["page_number"] == 1)
+        complete_json = json.dumps({
+            "requirements": [{"category": "Technical Requirements", "requirement_title": "Frequency Range",
+                             "description": "Frequency range 1 MHz to 20 MHz", "requirement_value": "1 MHz to 20 MHz",
+                             "evidence_text": "The bidder shall submit certificate.", "source_page": 1}],
+        })
+        result2 = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=complete_json))],
+            usage=SimpleNamespace(prompt_tokens=40, completion_tokens=80),
+        )
+        client.chat.completions.create.return_value = result2
+
+        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
+            service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
+
+        # 3. Assert no duplicate was created; still exactly 1 requirement
+        self.assertEqual(len(requirements.rows), 1)
+        self.assertEqual(requirements.rows[0]["requirement_title"], "Frequency Range")
+
+    def test_interrupted_batch_recovery(self):
+        analysis = {"_id": "analysis", "status": "processing", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        # Interrupted batch with attempt_count = 1
+        stale_time = service._now() - service.timedelta(seconds=400)
+        batch = {"_id": "b1", "analysis_id": "analysis", "batch_index": 0, "status": "processing",
+                 "attempt_count": 1, "last_activity_at": stale_time}
+        batches = MemoryCollection([batch])
+
+        service._recover_stale_batches("analysis", batches, lease_seconds=300, max_retries=3)
+
+        # Should be recovered to pending for retry
+        self.assertEqual(batches.rows[0]["status"], "pending")
+        self.assertIn("Recovered for retry", batches.rows[0]["error_message"])
+        self.assertEqual(batches.rows[0]["attempt_count"], 1)
+
+    def test_stale_processing_batch_recovery_bounded_retries(self):
+        analysis = {"_id": "analysis", "status": "processing", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        # Interrupted batch that has reached max retries (3)
+        stale_time = service._now() - service.timedelta(seconds=500)
+        batch = {"_id": "b1", "analysis_id": "analysis", "batch_index": 0, "status": "processing",
+                 "attempt_count": 3, "last_activity_at": stale_time}
+        batches = MemoryCollection([batch])
+
+        service._recover_stale_batches("analysis", batches, lease_seconds=300, max_retries=3)
+
+        # Should be marked failed, not pending
+        self.assertEqual(batches.rows[0]["status"], "failed")
+        self.assertIn("exceeded maximum retry attempts", batches.rows[0]["error_message"])
+
+    def test_concurrent_worker_protection(self):
+        analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        b0 = {"_id": "b0", "analysis_id": "analysis", "batch_index": 0, "status": "pending",
+              "user_id": "user", "tender_id": "tender", "file_hash": "hash", "prompt_version": "4",
+              "chunk_refs": [{"chunk_index": 1, "page_number": 1}]}
+        b1 = {"_id": "b1", "analysis_id": "analysis", "batch_index": 1, "status": "pending",
+              "user_id": "user", "tender_id": "tender", "file_hash": "hash", "prompt_version": "4",
+              "chunk_refs": [{"chunk_index": 2, "page_number": 2}]}
+        batches = MemoryCollection([b0, b1])
+        analyses = MemoryCollection([analysis])
+        chunks = MemoryCollection([
+            {"chunk_index": 1, "page_number": 1, "text": "Passage 1", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"chunk_index": 2, "page_number": 2, "text": "Passage 2", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+        ])
+        pages = MemoryCollection([
+            {"page_number": 1, "part_index": 0, "complete": True, "text": "Passage 1"},
+            {"page_number": 2, "part_index": 0, "complete": True, "text": "Passage 2"},
+        ])
+        requirements = MemoryCollection()
+
+        result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"requirements": []}'))],
+            usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10),
+        )
+        fake_client = Mock()
+        fake_client.chat.completions.create.return_value = result
+
+        with patch.object(service, "Groq", return_value=fake_client), patch.object(service, "_pace"):
+            # Worker 1 runs
+            w1 = service._process_batch(analysis, "token-w1", analyses, batches, requirements, pages, chunks)
+            # Worker 2 runs
+            w2 = service._process_batch(analysis, "token-w2", analyses, batches, requirements, pages, chunks)
+
+        self.assertTrue(w1)
+        self.assertTrue(w2)
+        # Both distinct batches completed
+        self.assertEqual(batches.rows[0]["status"], "completed")
+        self.assertEqual(batches.rows[1]["status"], "completed")
+
+    def test_pending_and_failed_batches_prevent_false_completion(self):
+        analysis = {"_id": "analysis", "total_processing_ms": 0, "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        analyses = MemoryCollection([dict(analysis)])
+        requirements = MemoryCollection()
+        chunks = MemoryCollection([
+            {"page_number": 1, "text": "Text 1", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"page_number": 2, "text": "Text 2", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+        ])
+
+        # Case A: Batch 0 completed, Batch 1 pending -> status must be 'processing', NOT 'completed'
+        b0 = {"_id": "b0", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 1}]}
+        b1 = {"_id": "b1", "analysis_id": "analysis", "status": "pending", "chunk_refs": [{"page_number": 2}]}
+        batches = MemoryCollection([b0, b1])
+        status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
+        self.assertEqual(status, "processing")
+        self.assertEqual(analyses.rows[0]["status"], "processing")
+        self.assertFalse(analyses.rows[0]["coverage"]["complete"])
+
+        # Case B: Batch 0 completed, Batch 1 failed -> status must be 'failed', NOT 'completed'
+        batches.rows[1]["status"] = "failed"
+        status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
+        self.assertEqual(status, "failed")
+        self.assertEqual(analyses.rows[0]["status"], "failed")
+
+    def test_all_pages_completed_and_saved_before_successful_completion(self):
+        analysis = {"_id": "analysis", "total_processing_ms": 0, "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        analyses = MemoryCollection([dict(analysis)])
+        chunks = MemoryCollection([
+            {"page_number": 1, "text": "Text 1", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"page_number": 2, "text": "Text 2", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"page_number": 3, "text": "Text 3", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+        ])
+        req = {"_id": "r1", "analysis_id": "analysis", "validation_status": "verified", "eligible_for_phase7": True}
+        requirements = MemoryCollection([req])
+
+        # Only pages 1 and 2 completed; page 3 has not completed
+        b0 = {"_id": "b0", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 1}]}
+        b1 = {"_id": "b1", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 2}]}
+        batches = MemoryCollection([b0, b1])
+
+        status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
+        # Incomplete coverage prevents 'completed' status
+        self.assertEqual(status, "needs_review")
+        self.assertFalse(analyses.rows[0]["coverage"]["complete"])
+        self.assertEqual(analyses.rows[0]["coverage"]["unexamined_pages"], 1)
+        self.assertEqual(analyses.rows[0]["coverage"]["unexamined_page_numbers"], [3])
+
+        # Now page 3 batch completes
+        b2 = {"_id": "b2", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 3}]}
+        batches.rows.append(b2)
+
+        status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
+        # All pages complete and verified -> 'completed'
+        self.assertEqual(status, "completed")
+        self.assertTrue(analyses.rows[0]["coverage"]["complete"])
+        self.assertEqual(analyses.rows[0]["coverage"]["unexamined_pages"], 0)
 
 
 if __name__ == "__main__":

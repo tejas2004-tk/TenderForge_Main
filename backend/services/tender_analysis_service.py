@@ -44,7 +44,7 @@ Keep these categories distinct:
 
 Return only JSON with keys overview and requirements. `overview` is an object containing only explicitly stated fields among tender_title, issuing_authority, tender_reference_number, procurement_method, submission_deadline, emd, tender_fees, and important_conditions. Each returned field must be an object with value, source_page, and evidence_text. Omit fields not stated in the passages. Do not return a prose summary.
 
-Each requirement must have category, requirement_title, description, requirement_value, mandatory (true, false, or null), requirement_status (mandatory, conditional, optional, informational, or unclear), applicability_condition (the condition that activates a conditional requirement, otherwise empty), source_page (a supplied page number), evidence_text (a concise exact excerpt copied from that page, usually one sentence; do not insert ellipses or paraphrase it), and extraction_status (extracted only when clearly supported, otherwise needs_review). Use conditional when the requirement applies only if a stated event, bidder class, or exception applies; do not label it an unconditional eligibility blocker. Keep descriptions to one concise sentence. Do not repeat a condition unless it imposes a materially different condition. Keep product specifications separate from bidder qualifications. Categories: """ + "; ".join(CATEGORY_NAMES) + "."
+Each requirement must have category, requirement_title, description, requirement_value, mandatory (true, false, or null), requirement_status (mandatory, conditional, optional, informational, or unclear), applicability_condition (the condition that activates a conditional requirement, otherwise empty), source_page (a supplied page number), evidence_text (a concise exact excerpt copied from that page, usually one sentence; do not insert ellipses or paraphrase it), and extraction_status (extracted only when clearly supported, otherwise needs_review). Use conditional when the requirement applies only if a stated event, bidder class, or exception applies; do not label it an unconditional eligibility blocker. Keep descriptions to one concise sentence, evidence excerpts under 300 characters, and omit repeated or low-value wording. Do not repeat a condition unless it imposes a materially different condition. Keep product specifications separate from bidder qualifications. Categories: """ + "; ".join(CATEGORY_NAMES) + "."
 USER_PREFIX = "Extract the relevant bidder conditions. Return only supported facts and exact source excerpts. Do not repeat a condition unless materially distinct. For conflicting passages, return each condition with its evidence. Use null for uncertain page, empty text for unknown values, and do not infer.\n\nSOURCE PASSAGES:\n"
 _logger = logging.getLogger(__name__)
 _INDEX_LOCK = threading.Lock()
@@ -64,6 +64,9 @@ _RELEVANCE = [re.compile(p, re.I) for p in (
     r"technical qualification|technical eligibility|technical capability|bidder shall|tenderer shall",
     r"annexure|appendix|declaration|undertaking|proforma|bid form",
     r"(?:rs\.?|inr|₹)\s*[\d,]+|\b\d+(?:\.\d+)?\s*%|\b\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}\b",
+    r"technical specification|specifications?|technical requirements?|scope of work|scope of supply|bill of quantit|boq|schedule of requirement",
+    r"warranty|guarantee|payment terms?|payment after|delivery|installation|liquidated damages|indemnif",
+    r"arbitration|jurisdiction|force majeure|termination|cancell?ation|penalty|penalties|inspection|general conditions|special conditions|gcc|scc",
 )]
 _BIDDER_CUES = re.compile(
     r"bidder|tenderer|applicant|contractor|vendor|supplier|agency|firm|company|oem|eligible|qualification|"
@@ -272,7 +275,9 @@ def _new_analysis_record(key, extraction, run_origin="standard", request_id=None
         "total_batches": 0, "completed_batches": 0, "pending_batches": 0, "failed_batches": 0,
         "requirement_count": 0, "verified_requirement_count": 0, "review_requirement_count": 0,
         "phase7_eligible_count": 0,
-        "request_count": 0, "estimated_input_tokens": 0, "actual_input_tokens": 0, "actual_output_tokens": 0,
+        "request_count": 0, "api_call_count": 0, "retry_count": 0,
+        "estimated_input_tokens": 0, "actual_input_tokens": 0, "actual_output_tokens": 0,
+        "total_tokens": 0,
         "missing_actual_usage_batches": 0, "unknown_usage_requests": 0, "total_processing_ms": 0,
         "overview_parts": [], "overview_fields": {}, "analysis_version": key["analysis_version"],
         "analysis_logic_version": str(version), "run_origin": run_origin,
@@ -318,13 +323,23 @@ def _plan_batches(analysis, batches, chunks, page_count):
     query = {"user_id": analysis["user_id"], "tender_id": analysis["tender_id"], "file_hash": analysis["file_hash"]}
     batches.delete_many({"analysis_id": analysis_id})
     candidate_pages, text_pages = set(), set()
-    source_count = 0
-    for row in chunks.find(query, {"page_number": 1, "text": 1}).sort("chunk_index", ASCENDING):
-        source_count += 1
+    all_rows = list(chunks.find(query, {"chunk_index": 1, "page_number": 1, "text": 1}).sort("chunk_index", ASCENDING))
+    candidate_rows = []
+    try:
+        ready_chunks = get_database(current_app).tender_llm_ready_chunks
+        candidate_rows = list(ready_chunks.find(
+            query, {"chunk_index": 1, "page_number": 1, "text": 1}
+        ).sort("chunk_index", ASCENDING))
+    except (AttributeError, KeyError, PyMongoError):
+        candidate_rows = []
+    candidate_rows = candidate_rows or all_rows
+    for row in all_rows:
         page = row.get("page_number")
         if isinstance(page, int):
-            text_pages.add(page)
-            if _score(row.get("text", "")):
+            chunk_text = row.get("text", "")
+            if chunk_text and chunk_text.strip():
+                text_pages.add(page)
+            if any(candidate.get("chunk_index") == row.get("chunk_index") for candidate in candidate_rows):
                 candidate_pages.add(page)
     selected = set(candidate_pages)
     for page in candidate_pages:
@@ -334,15 +349,27 @@ def _plan_batches(analysis, batches, chunks, page_count):
         selected.add(1)
     if page_count in text_pages:
         selected.add(page_count)
+    if (page_count and page_count <= 12) or (text_pages and len(text_pages) <= 12):
+        selected.update(text_pages)
+
+    rows_by_page = {}
+    for row in candidate_rows:
+        rows_by_page.setdefault(row.get("page_number"), []).append(row)
+    for page in sorted(text_pages):
+        if page not in rows_by_page:
+            rows_by_page[page] = [row for row in all_rows if row.get("page_number") == page]
+        selected.add(page)
 
     base_tokens = _estimate_tokens(SYSTEM_PROMPT + USER_PREFIX)
     max_input = _max_input()
     if base_tokens >= max_input:
         raise AnalysisError("The configured input-token budget is too small for the analysis prompt.", 503)
-    refs, text_tokens, batch_index = [], 0, 0
+    refs, text_tokens, expected_output_tokens, batch_index = [], 0, 0, 0
+    max_source_tokens = max_input - base_tokens
+    max_expected_output = max(400, _max_output() - 200)
 
     def save_batch():
-        nonlocal refs, text_tokens, batch_index
+        nonlocal refs, text_tokens, expected_output_tokens, batch_index
         if not refs:
             return
         now = _now()
@@ -353,34 +380,49 @@ def _plan_batches(analysis, batches, chunks, page_count):
             "is_overview_batch": batch_index == 0,
             "prompt_version": current_app.config.get("ANALYSIS_PROMPT_VERSION", PROMPT_VERSION),
             "estimated_input_tokens": base_tokens + text_tokens,
-            "status": "pending", "attempt_count": 0,
+            "estimated_output_tokens": expected_output_tokens,
+            "status": "pending", "attempt_count": 0, "api_call_count": 0, "retry_count": 0,
+            "total_tokens": 0,
             "created_at": now, "updated_at": now,
         })
-        refs, text_tokens = [], 0
+        refs, text_tokens, expected_output_tokens = [], 0, 0
         batch_index += 1
 
-    for row in chunks.find(query, {"chunk_index": 1, "page_number": 1, "text": 1}).sort("chunk_index", ASCENDING):
-        page = row.get("page_number")
-        if page not in selected:
+    for page in sorted(selected):
+        page_rows = rows_by_page.get(page, [])
+        if not page_rows:
             continue
-        item_tokens = _estimate_tokens(f"[SOURCE PAGE {page}]\n{row.get('text', '')}\n[/SOURCE PAGE]")
-        if base_tokens + item_tokens > max_input:
+        page_refs = []
+        page_tokens = 0
+        for row in page_rows:
+            page_tokens += _estimate_tokens(f"[SOURCE PAGE {page}]\n{row.get('text', '')}\n[/SOURCE PAGE]")
+            page_refs.append({"chunk_index": row["chunk_index"], "page_number": page})
+        page_output = _expected_output_tokens(page_tokens)
+        if base_tokens + page_tokens > max_input:
             raise AnalysisError("A saved text passage exceeds the configured input-token budget and was not sent.", 413)
-        if refs and base_tokens + text_tokens + item_tokens > max_input:
+        if refs and (text_tokens + page_tokens > max_source_tokens or
+                     expected_output_tokens + page_output > max_expected_output):
             save_batch()
-        refs.append({"chunk_index": row["chunk_index"], "page_number": page})
-        text_tokens += item_tokens
+        refs.extend(page_refs)
+        text_tokens += page_tokens
+        expected_output_tokens += page_output
     save_batch()
-    missing = sorted(text_pages - selected)
+    planned_pages = set()
+    for batch_doc in batches.find({"analysis_id": analysis_id}, {"chunk_refs": 1}):
+        for ref in batch_doc.get("chunk_refs", []):
+            if isinstance(ref.get("page_number"), int):
+                planned_pages.add(ref["page_number"])
+    missing = sorted(text_pages - planned_pages)
     selected_chunks = sum(len(batch.get("chunk_refs", [])) for batch in batches.find({"analysis_id": analysis_id}, {"chunk_refs": 1}))
     coverage = {
         "total_pages": page_count, "pages_with_text": len(text_pages),
-        "selected_pages": len(selected), "unexamined_pages": len(missing),
-        "unexamined_page_numbers": missing[:100],
-        "ratio": round(min(1.0, len(selected) / max(len(text_pages), 1)), 3),
-        "complete": not missing,
-        "selection_method": "bidder-keyword screening with adjacent-page context",
-        "source_chunks": source_count, "selected_chunks": selected_chunks,
+        "selected_pages": 0, "unexamined_pages": len(text_pages),
+        "unexamined_page_numbers": sorted(text_pages)[:100],
+        "ratio": 0.0,
+        "complete": False,
+        "planned_pages": len(planned_pages),
+        "selection_method": "batch planning",
+        "source_chunks": len(all_rows), "selected_chunks": 0,
     }
     return batches.count_documents({"analysis_id": analysis_id}), coverage
 
@@ -443,11 +485,17 @@ def _groq_request(messages, analysis, batch, analyses, batches, token):
         _pace()
         now = _now()
         analyses.update_one({"_id": analysis["_id"], "processing_token": token}, {
-            "$inc": {"request_count": 1, "estimated_input_tokens": estimated},
+            "$inc": {
+                "request_count": 1, "api_call_count": 1,
+                "estimated_input_tokens": estimated,
+                "retry_count": 1 if attempt else 0,
+            },
             "$set": {"updated_at": now},
             "$addToSet": {"prompt_versions_used": batch["prompt_version"]},
         })
-        batches.update_one({"_id": batch["_id"]}, {"$inc": {"attempt_count": 1}, "$set": {"last_attempt_at": now, "updated_at": now}})
+        batches.update_one({"_id": batch["_id"]}, {"$inc": {
+            "attempt_count": 1, "api_call_count": 1, "retry_count": 1 if attempt else 0,
+        }, "$set": {"last_attempt_at": now, "last_activity_at": now, "updated_at": now}})
         started = time.perf_counter()
         try:
             result = client.chat.completions.create(
@@ -455,6 +503,8 @@ def _groq_request(messages, analysis, batch, analyses, batches, token):
                 max_tokens=_max_output(), temperature=0,
             )
             usage = getattr(result, "usage", None)
+            now_done = _now()
+            batches.update_one({"_id": batch["_id"]}, {"$set": {"last_activity_at": now_done, "updated_at": now_done}})
             return (result, estimated,
                     getattr(usage, "prompt_tokens", None) if usage else None,
                     getattr(usage, "completion_tokens", None) if usage else None,
@@ -722,8 +772,14 @@ def _canonical_requirement_topic(category, title, description, value, evidence):
 
 
 def _anchors_compatible(left, right):
-    left, right = set(left or ()), set(right or ())
+    left = {tuple(anchor) if isinstance(anchor, list) else anchor for anchor in (left or ())}
+    right = {tuple(anchor) if isinstance(anchor, list) else anchor for anchor in (right or ())}
     return not left or not right or left.issubset(right) or right.issubset(left)
+
+
+def _expected_output_tokens(source_tokens):
+    """Reserve output headroom based on the amount of source sent to the model."""
+    return max(400, min(_max_output() - 200, math.ceil(source_tokens * 0.75)))
 
 
 def _requirement_status(raw, text):
@@ -737,7 +793,7 @@ def _requirement_status(raw, text):
         return "conditional"
     if _MANDATORY_CUES.search(text):
         return "mandatory"
-    if raw_status in allowed:
+    if isinstance(raw_status, str) and raw_status in allowed:
         return raw_status
     mandatory = raw.get("mandatory") if isinstance(raw, dict) else None
     if mandatory is True:
@@ -850,7 +906,16 @@ def _validate_requirement(raw, batch_pages, analysis, batch, evidence_matches, i
     if not page_valid:
         reasons.append("Source page or evidence could not be verified against saved PDF text.")
     source_text = (source_texts or {}).get(source_page, evidence) if source_page is not None else evidence
-    claims_valid = all(_claim_supported(claim, source_text) for claim in (title, description, value))
+    title_anchors = _numeric_anchors(title) if title else set()
+    source_anchors = _numeric_anchors(source_text) if source_text else set()
+    title_anchors_supported = not any(
+        not any(number == source_number and (not unit or unit == source_unit)
+                for source_number, source_unit in source_anchors)
+        for number, unit in title_anchors
+    )
+    description_supported = _claim_supported(description, source_text)
+    value_supported = _claim_supported(value, source_text)
+    claims_valid = description_supported and value_supported and title_anchors_supported
     evidence_value_valid = _claim_supported(value, evidence)
     value_valid = claims_valid and evidence_value_valid
     if not value_valid:
@@ -1069,6 +1134,138 @@ def _response_text(result):
         return None
 
 
+def _extract_partial_response(content):
+    """Attempt to recover valid requirements and overview fields from a truncated JSON response."""
+    if not isinstance(content, str) or not content.strip():
+        return None, []
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            reqs = parsed.get("requirements", [])
+            overview = parsed.get("overview")
+            return overview, [r for r in reqs if isinstance(r, dict)]
+    except Exception:
+        pass
+
+    decoder = json.JSONDecoder()
+    overview = None
+    requirements = []
+
+    ov_idx = content.find('"overview"')
+    if ov_idx != -1:
+        brace_idx = content.find('{', ov_idx)
+        if brace_idx != -1:
+            try:
+                obj, _ = decoder.raw_decode(content, brace_idx)
+                if isinstance(obj, dict):
+                    overview = obj
+            except Exception:
+                pass
+
+    req_idx = content.find('"requirements"')
+    if req_idx != -1:
+        bracket_idx = content.find('[', req_idx)
+        if bracket_idx != -1:
+            curr = bracket_idx + 1
+            while curr < len(content):
+                next_brace = content.find('{', curr)
+                if next_brace == -1:
+                    break
+                try:
+                    obj, end = decoder.raw_decode(content, next_brace)
+                    if isinstance(obj, dict) and any(k in obj for k in ("requirement_title", "category", "description", "source_page")):
+                        requirements.append(obj)
+                    curr = end
+                except Exception:
+                    break
+
+    return overview, requirements
+
+
+def _recover_stale_batches(analysis_id, batches, lease_seconds=300, max_retries=3):
+    """Detect batches left in 'processing' whose lease/activity timed out, recovering or failing them."""
+    now = _now()
+    timeout = timedelta(seconds=max(30, lease_seconds))
+    stale_candidates = list(batches.find({"analysis_id": analysis_id, "status": "processing"}))
+    for batch in stale_candidates:
+        activity = batch.get("last_activity_at") or batch.get("processing_started_at") or batch.get("updated_at")
+        if activity:
+            activity_utc = _as_utc(activity)
+            if activity_utc and (now - activity_utc) < timeout:
+                continue
+        attempts = batch.get("attempt_count", 0)
+        if attempts >= max_retries:
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "status": "failed",
+                "completed_at": None,
+                "error_message": f"Batch processing stalled and exceeded maximum retry attempts ({attempts}/{max_retries}).",
+                "last_activity_at": now,
+                "updated_at": now,
+            }})
+            _logger.warning("Marked stale batch %s (index %s) as failed after %d attempts",
+                            batch.get("_id"), batch.get("batch_index"), attempts)
+        else:
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "status": "pending",
+                "completed_at": None,
+                "error_message": "Previous processing attempt timed out or was interrupted. Recovered for retry.",
+                "last_activity_at": now,
+                "updated_at": now,
+            }})
+            _logger.info("Recovered stale processing batch %s (index %s) for retry (attempt %d/%d)",
+                         batch.get("_id"), batch.get("batch_index"), attempts, max_retries)
+
+
+def _calculate_actual_coverage(analysis, batches, chunks=None):
+    aid = analysis["_id"]
+    query = {"user_id": analysis["user_id"], "tender_id": analysis["tender_id"], "file_hash": analysis["file_hash"]}
+    text_pages = set()
+    source_count = 0
+    if chunks is not None:
+        for row in chunks.find(query, {"page_number": 1, "text": 1}):
+            source_count += 1
+            page = row.get("page_number")
+            if isinstance(page, int) and str(row.get("text", "")).strip():
+                text_pages.add(page)
+    if not text_pages:
+        all_batches = list(batches.find({"analysis_id": aid}, {"chunk_refs": 1}))
+        for b in all_batches:
+            for ref in b.get("chunk_refs", []):
+                p = ref.get("page_number")
+                if isinstance(p, int):
+                    text_pages.add(p)
+        source_count = len(text_pages)
+
+    page_count = analysis.get("page_count", len(text_pages))
+    completed_batches = list(batches.find({"analysis_id": aid, "status": "completed"}, {"chunk_refs": 1}))
+    completed_pages = set()
+    completed_chunks = 0
+    for b in completed_batches:
+        refs = b.get("chunk_refs", [])
+        completed_chunks += len(refs)
+        for ref in refs:
+            p = ref.get("page_number")
+            if isinstance(p, int):
+                completed_pages.add(p)
+
+    missing = sorted(text_pages - completed_pages)
+    ratio = round(min(1.0, len(completed_pages) / max(len(text_pages), 1)), 3)
+    is_complete = len(missing) == 0 and len(text_pages) > 0
+
+    return {
+        "total_pages": page_count,
+        "pages_with_text": len(text_pages),
+        "selected_pages": len(completed_pages),
+        "unexamined_pages": len(missing),
+        "unexamined_page_numbers": missing[:100],
+        "ratio": ratio,
+        "complete": is_complete,
+        "selection_method": "complete coverage" if is_complete else "partial batch processing",
+        "source_chunks": source_count,
+        "selected_chunks": completed_chunks,
+    }
+
+
 def _split_truncated_batch(batch, batches):
     """Create stable, independently resumable child tasks for a truncated batch."""
     batch_id = batch["_id"]
@@ -1084,6 +1281,7 @@ def _split_truncated_batch(batch, batches):
         if len(groups) <= 1:
             batches.update_one({"_id": batch_id}, {"$set": {
                 "status": "manual_review", "split_plan": [], "completed_at": None,
+                "last_activity_at": _now(),
                 "error_message": "This source passage still exceeded the output limit when isolated. Review this page manually.",
                 "updated_at": _now(),
             }})
@@ -1105,10 +1303,12 @@ def _split_truncated_batch(batch, batches):
             "chunk_refs": child["chunk_refs"], "parent_batch_id": batch_id,
             "is_overview_batch": bool(batch.get("is_overview_batch", False)),
             "prompt_version": batch.get("prompt_version") or current_app.config.get("ANALYSIS_PROMPT_VERSION", PROMPT_VERSION),
-            "status": "pending", "attempt_count": 0, "created_at": _now(), "updated_at": _now(),
+            "status": "pending", "attempt_count": 0, "api_call_count": 0, "retry_count": 0,
+            "total_tokens": 0, "created_at": _now(), "updated_at": _now(),
         }}, upsert=True)
     batches.update_one({"_id": batch_id}, {"$set": {
         "status": "split", "child_batch_ids": [child["_id"] for child in plan],
+        "last_activity_at": _now(),
         "error_message": "Truncated task was split into smaller resumable tasks.", "updated_at": _now(),
     }})
     return len(plan)
@@ -1120,12 +1320,55 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
     if batch:
         _split_truncated_batch(batch, batches)
         return True
-    batch = batches.find_one({"analysis_id": analysis["_id"], "status": {"$in": ["pending", "failed"]}},
-                             sort=[("batch_index", ASCENDING)])
+
+    lease_seconds = int(current_app.config.get("ANALYSIS_LEASE_SECONDS", 300))
+    max_retries = max(1, min(5, int(current_app.config.get("ANALYSIS_RETRY_ATTEMPTS", 3))))
+    now = _now()
+
+    # Atomically claim a pending or retryable batch
+    batch = batches.find_one_and_update(
+        {
+            "analysis_id": analysis["_id"],
+            "status": {"$in": ["pending", "failed"]},
+            "$or": [{"attempt_count": {"$exists": False}}, {"attempt_count": {"$lt": max_retries}}],
+        },
+        {
+            "$set": {
+                "status": "processing",
+                "processing_token": token,
+                "processing_started_at": now,
+                "last_activity_at": now,
+                "updated_at": now,
+                "error_message": None,
+            }
+        },
+        sort=[("batch_index", ASCENDING)],
+        return_document=ReturnDocument.AFTER,
+    )
     if not batch:
-        return False
-    # Backfill the flags for batches planned by an earlier Phase 6 build. The saved
-    # flag is then carried through retries, splits, and subsequent resumes.
+        _recover_stale_batches(analysis["_id"], batches, lease_seconds, max_retries)
+        batch = batches.find_one_and_update(
+            {
+                "analysis_id": analysis["_id"],
+                "status": {"$in": ["pending", "failed"]},
+                "$or": [{"attempt_count": {"$exists": False}}, {"attempt_count": {"$lt": max_retries}}],
+            },
+            {
+                "$set": {
+                    "status": "processing",
+                    "processing_token": token,
+                    "processing_started_at": now,
+                    "last_activity_at": now,
+                    "updated_at": now,
+                    "error_message": None,
+                }
+            },
+            sort=[("batch_index", ASCENDING)],
+            return_document=ReturnDocument.AFTER,
+        )
+        if not batch:
+            return False
+
     batch_metadata = {}
     current_prompt_version = current_app.config.get("ANALYSIS_PROMPT_VERSION", PROMPT_VERSION)
     if "is_overview_batch" not in batch:
@@ -1140,76 +1383,112 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
     if batch.get("status") == "split_pending":
         _split_truncated_batch(batch, batches)
         return True
-    refs = batch.get("chunk_refs", [])
-    indexes = [ref["chunk_index"] for ref in refs]
-    rows = list(chunks.find({
-        "user_id": analysis["user_id"], "tender_id": analysis["tender_id"],
-        "file_hash": analysis["file_hash"], "chunk_index": {"$in": indexes},
-    }, {"chunk_index": 1, "page_number": 1, "text": 1}))
-    by_index = {row["chunk_index"]: row for row in rows}
-    if len(by_index) != len(refs):
-        raise AnalysisError("Saved PDF text changed or is incomplete. Reprocess the tender before analysis.", 409)
-    passages = []
-    for ref in refs:
-        source = by_index[ref["chunk_index"]]
-        if source.get("page_number") != ref["page_number"]:
-            raise AnalysisError("Saved PDF page references changed. Reprocess the tender before analysis.", 409)
-        passages.append(f"[SOURCE PAGE {ref['page_number']}]\n{source.get('text', '')}\n[/SOURCE PAGE]")
-    overview_instruction = ("Extract structured overview fields explicitly supported by these passages: tender identity, dates, fees/security, and important conditions.\n\n") if batch.get("is_overview_batch") else "Extract requirements only. In overview, return important_conditions only if new, explicit conditions occur in this batch; do not repeat tender identity fields.\n\n"
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": USER_PREFIX + overview_instruction + "\n\n".join(passages)},
-    ]
-    estimate = _estimate_tokens("".join(message["content"] for message in messages))
-    if estimate > _max_input():
-        raise AnalysisError("A saved batch exceeded the token budget and was not sent.", 413)
-    batches.update_one({"_id": batch["_id"]}, {"$set": {"status": "processing", "updated_at": _now(), "error_message": None}})
-    result, estimate, actual_in, actual_out, request_ms = _groq_request(messages, analysis, batch, analyses, batches, token)
-    usage_values = {}
-    if actual_in is not None:
-        usage_values["actual_input_tokens"] = actual_in
-    if actual_out is not None:
-        usage_values["actual_output_tokens"] = actual_out
-    if actual_in is None or actual_out is None:
-        usage_values["missing_actual_usage_batches"] = 1
-    increments = {key: value for key, value in usage_values.items()}
-    # Token counts are saved before parsing so malformed responses still retain usage data.
-    analyses.update_one({"_id": analysis["_id"], "processing_token": token}, {"$inc": increments} if increments else {"$set": {"updated_at": _now()}})
-    batches.update_one({"_id": batch["_id"]}, {"$set": {
-        "estimated_input_tokens": estimate, "actual_input_tokens": actual_in,
-        "actual_output_tokens": actual_out, "request_duration_ms": round(request_ms, 1),
-        "updated_at": _now(),
-    }})
+
     try:
-        finish_reason = result.choices[0].finish_reason
-    except (AttributeError, IndexError, TypeError):
-        finish_reason = None
-    if str(finish_reason).casefold() == "length":
+        refs = batch.get("chunk_refs", [])
+        indexes = [ref["chunk_index"] for ref in refs]
+        rows = list(chunks.find({
+            "user_id": analysis["user_id"], "tender_id": analysis["tender_id"],
+            "file_hash": analysis["file_hash"], "chunk_index": {"$in": indexes},
+        }, {"chunk_index": 1, "page_number": 1, "text": 1}))
+        by_index = {row["chunk_index"]: row for row in rows}
+        if len(by_index) != len(refs):
+            raise AnalysisError("Saved PDF text changed or is incomplete. Reprocess the tender before analysis.", 409)
+        passages = []
+        for ref in refs:
+            source = by_index[ref["chunk_index"]]
+            if source.get("page_number") != ref["page_number"]:
+                raise AnalysisError("Saved PDF page references changed. Reprocess the tender before analysis.", 409)
+            passages.append(f"[SOURCE PAGE {ref['page_number']}]\n{source.get('text', '')}\n[/SOURCE PAGE]")
+        overview_instruction = ("Extract structured overview fields explicitly supported by these passages: tender identity, dates, fees/security, and important conditions.\n\n") if batch.get("is_overview_batch") else "Extract requirements only. In overview, return important_conditions only if new, explicit conditions occur in this batch; do not repeat tender identity fields.\n\n"
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": USER_PREFIX + overview_instruction + "\n\n".join(passages)},
+        ]
+        estimate = _estimate_tokens("".join(message["content"] for message in messages))
+        if estimate > _max_input():
+            raise AnalysisError("A saved batch exceeded the token budget and was not sent.", 413)
+
+        batches.update_one({"_id": batch["_id"]}, {"$set": {"last_activity_at": _now()}})
+        result, estimate, actual_in, actual_out, request_ms = _groq_request(messages, analysis, batch, analyses, batches, token)
+        usage_values = {}
+        if actual_in is not None:
+            usage_values["actual_input_tokens"] = actual_in
+        if actual_out is not None:
+            usage_values["actual_output_tokens"] = actual_out
+        if actual_in is None or actual_out is None:
+            usage_values["missing_actual_usage_batches"] = 1
+        if actual_in is not None and actual_out is not None:
+            usage_values["total_tokens"] = actual_in + actual_out
+        increments = {key: value for key, value in usage_values.items()}
+        analyses.update_one({"_id": analysis["_id"], "processing_token": token}, {"$inc": increments} if increments else {"$set": {"updated_at": _now()}})
+        batch_usage = {
+            "estimated_input_tokens": estimate, "actual_input_tokens": actual_in,
+            "actual_output_tokens": actual_out,
+            "request_duration_ms": round(request_ms, 1),
+            "last_activity_at": _now(), "updated_at": _now(),
+        }
+        if actual_in is not None and actual_out is not None:
+            batch_usage["total_tokens"] = actual_in + actual_out
+        batches.update_one({"_id": batch["_id"]}, {"$set": batch_usage})
+
+        try:
+            finish_reason = result.choices[0].finish_reason
+        except (AttributeError, IndexError, TypeError):
+            finish_reason = None
+
+        if str(finish_reason).casefold() == "length":
+            response_text = _response_text(result)
+            partial_overview, partial_reqs = _extract_partial_response(response_text)
+            saved_partial_count = 0
+            if partial_reqs:
+                saved_partial_count = _save_requirements(partial_reqs, analysis, batch, pages, requirements)
+                _logger.info("Preserved %d partial requirements from truncated batch %d", saved_partial_count, batch["batch_index"])
+            if partial_overview:
+                if not batch.get("is_overview_batch") and isinstance(partial_overview, dict):
+                    partial_overview = {"important_conditions": partial_overview.get("important_conditions")}
+                overview_fields = _validated_overview_fields(partial_overview, analysis, batch, pages)
+                if overview_fields:
+                    merged_overview = _merge_overview_fields(analysis.get("overview_fields", {}), overview_fields)
+                    analyses.update_one({"_id": analysis["_id"], "processing_token": token},
+                                        {"$set": {"overview_fields": merged_overview, "updated_at": _now()}})
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "status": "split_pending", "finish_reason": finish_reason,
+                "completed_at": None, "last_activity_at": _now(), "updated_at": _now(),
+                "partial_requirement_count": saved_partial_count,
+                "error_message": "Groq reached the output-token limit. The source references will be retried in smaller tasks.",
+            }})
+            _logger.warning("Tender analysis batch=%d output was truncated at the configured token limit; partial findings were preserved and task was split", batch["batch_index"])
+            _split_truncated_batch({**batch, "status": "split_pending", "finish_reason": finish_reason}, batches)
+            return True
+
+        parsed = _parse_response(_response_text(result))
+        count = _save_requirements(parsed["requirements"], analysis, batch, pages, requirements)
+        overview_raw = parsed.get("overview")
+        if not batch.get("is_overview_batch") and isinstance(overview_raw, dict):
+            overview_raw = {"important_conditions": overview_raw.get("important_conditions")}
+        overview_fields = _validated_overview_fields(overview_raw, analysis, batch, pages)
+        merged_overview = _merge_overview_fields(analysis.get("overview_fields", {}), overview_fields)
         batches.update_one({"_id": batch["_id"]}, {"$set": {
-            "status": "split_pending", "finish_reason": finish_reason,
-            "completed_at": None, "updated_at": _now(),
-            "error_message": "Groq reached the output-token limit. The source references will be retried in smaller tasks.",
+            "status": "completed", "overview_fields": overview_fields, "requirement_count": count,
+            "finish_reason": finish_reason,
+            "completed_at": _now(), "last_activity_at": _now(), "updated_at": _now(), "error_message": None,
         }})
-        _logger.warning("Tender analysis batch=%d output was truncated at the configured token limit; partial findings were discarded", batch["batch_index"])
-        _split_truncated_batch({**batch, "status": "split_pending", "finish_reason": finish_reason}, batches)
+        analyses.update_one({"_id": analysis["_id"], "processing_token": token},
+                            {"$set": {"overview_fields": merged_overview, "updated_at": _now()}})
+        _logger.info("Tender analysis batch=%d duration_ms=%.1f estimated_input_tokens=%d actual_input_tokens=%s output_tokens=%s finish_reason=%s requirements=%d",
+                     batch["batch_index"], request_ms, estimate, actual_in, actual_out, finish_reason, count)
         return True
-    parsed = _parse_response(_response_text(result))
-    count = _save_requirements(parsed["requirements"], analysis, batch, pages, requirements)
-    overview_raw = parsed.get("overview")
-    if not batch.get("is_overview_batch") and isinstance(overview_raw, dict):
-        overview_raw = {"important_conditions": overview_raw.get("important_conditions")}
-    overview_fields = _validated_overview_fields(overview_raw, analysis, batch, pages)
-    merged_overview = _merge_overview_fields(analysis.get("overview_fields", {}), overview_fields)
-    batches.update_one({"_id": batch["_id"]}, {"$set": {
-        "status": "completed", "overview_fields": overview_fields, "requirement_count": count,
-        "finish_reason": finish_reason,
-        "completed_at": _now(), "updated_at": _now(), "error_message": None,
-    }})
-    analyses.update_one({"_id": analysis["_id"], "processing_token": token},
-                        {"$set": {"overview_fields": merged_overview, "updated_at": _now()}})
-    _logger.info("Tender analysis batch=%d duration_ms=%.1f estimated_input_tokens=%d actual_input_tokens=%s output_tokens=%s finish_reason=%s requirements=%d",
-                 batch["batch_index"], request_ms, estimate, actual_in, actual_out, finish_reason, count)
-    return True
+    except AnalysisPaused:
+        raise
+    except Exception as error:
+        batches.update_one({"_id": batch["_id"]}, {"$set": {
+            "status": "failed",
+            "error_message": str(error) or "Batch processing failed.",
+            "last_activity_at": _now(),
+            "updated_at": _now(),
+        }})
+        raise
 
 
 def _summary(analysis, extraction_status=None, in_progress=False):
@@ -1221,6 +1500,7 @@ def _summary(analysis, extraction_status=None, in_progress=False):
         "extraction_status": extraction_status, "page_count": analysis.get("page_count", 0),
         "progress": {"total_batches": analysis.get("total_batches", 0),
                      "completed_batches": analysis.get("completed_batches", 0),
+                     "processing_batches": analysis.get("processing_batches", 0),
                      "pending_batches": analysis.get("pending_batches", 0),
                      "failed_batches": analysis.get("failed_batches", 0)},
         "coverage": analysis.get("coverage", {}),
@@ -1265,40 +1545,54 @@ def _public_analysis(analysis, requirements):
     return output
 
 
-def _refresh_counts(analysis, analyses, batches, requirements, status_override=None, message=None):
+def _refresh_counts(analysis, analyses, batches, requirements, status_override=None, message=None, chunks=None):
     aid = analysis["_id"]
+    lease_seconds = int(current_app.config.get("ANALYSIS_LEASE_SECONDS", 300))
+    max_retries = max(1, min(5, int(current_app.config.get("ANALYSIS_RETRY_ATTEMPTS", 3))))
+    _recover_stale_batches(aid, batches, lease_seconds, max_retries)
+
     total = batches.count_documents({"analysis_id": aid, "status": {"$ne": "split"}})
     completed = batches.count_documents({"analysis_id": aid, "status": "completed"})
     failed = batches.count_documents({"analysis_id": aid, "status": "failed"})
     manual_review = batches.count_documents({"analysis_id": aid, "status": "manual_review"})
-    pending = total - completed - failed - manual_review
+    processing = batches.count_documents({"analysis_id": aid, "status": "processing"})
+    pending = batches.count_documents({"analysis_id": aid, "status": {"$in": ["pending", "split_pending"]}})
+
     total_reqs = requirements.count_documents({"analysis_id": aid})
     verified = requirements.count_documents({"analysis_id": aid, "validation_status": "verified"})
     phase7_eligible = requirements.count_documents({"analysis_id": aid, "eligible_for_phase7": True})
     review = total_reqs - verified
+
+    coverage = _calculate_actual_coverage(analysis, batches, chunks)
+
     if status_override:
         status = status_override
-    elif failed:
+    elif failed > 0:
         status = "failed"
-    elif pending:
+    elif pending > 0 or processing > 0:
         status = "processing"
-    elif manual_review or review or not analysis.get("coverage", {}).get("complete") or not phase7_eligible:
+    elif manual_review > 0 or not coverage.get("complete"):
+        status = "needs_review"
+    elif review > 0 or not phase7_eligible:
         status = "needs_review"
     else:
         status = "completed"
+
     now = _now()
     run_start = _as_utc(analysis.get("active_started_at", now))
     elapsed = max(0.0, (now - run_start).total_seconds() * 1000)
     total_elapsed = round(analysis.get("total_processing_ms", 0) + elapsed, 1)
     analyses.update_one({"_id": aid}, {"$set": {
         "status": status, "total_batches": total, "completed_batches": completed,
-        "pending_batches": pending, "failed_batches": failed,
+        "processing_batches": processing, "pending_batches": pending, "failed_batches": failed,
+        "manual_review_batches": manual_review,
+        "coverage": coverage,
         "requirement_count": total_reqs, "verified_requirement_count": verified,
         "review_requirement_count": review, "phase7_eligible_count": phase7_eligible,
         "total_processing_ms": total_elapsed,
         "updated_at": now, "error_message": message,
         "processing_finished_at": now if status in {"completed", "needs_review", "failed"} else None,
-        "lease_until": None,
+        "lease_until": None if status != "processing" else analysis.get("lease_until"),
     }, "$unset": {"processing_token": "", "active_started_at": ""}})
     return status
 
@@ -1424,24 +1718,33 @@ def _advance(analysis, analyses, batches, requirements, pages, chunks):
         latest = analyses.find_one({"_id": analysis["_id"]})
         return _public_analysis(latest, requirements) | {"in_progress": True}
     try:
-        # A process crash can leave its batch marked as processing after the lease expires.
-        batches.update_many({"analysis_id": claim["_id"], "status": "processing"}, {
-            "$set": {"status": "pending", "error_message": "Previous processing stopped before this batch was saved.", "updated_at": now}
-        })
+        lease_time = int(current_app.config.get("ANALYSIS_LEASE_SECONDS", 300))
+        max_retries = max(1, min(5, int(current_app.config.get("ANALYSIS_RETRY_ATTEMPTS", 3))))
+        _recover_stale_batches(claim["_id"], batches, lease_time, max_retries)
+
         if not claim.get("plan_ready"):
             total, coverage = _plan_batches(claim, batches, chunks, claim.get("page_count", 0))
-            lease_time = int(current_app.config.get("ANALYSIS_LEASE_SECONDS", 300))
             analyses.update_one({"_id": claim["_id"], "processing_token": token}, {"$set": {
                 "plan_ready": True, "coverage": coverage, "total_batches": total,
                 "pending_batches": total, "updated_at": _now(),
                 "lease_until": _now() + timedelta(seconds=lease_time),
             }})
             claim.update({"plan_ready": True, "coverage": coverage, "total_batches": total})
-        worked = _process_batch(claim, token, analyses, batches, requirements, pages, chunks)
+        worked = False
+        while True:
+            batch_worked = _process_batch(claim, token, analyses, batches, requirements, pages, chunks)
+            worked = worked or batch_worked
+            if not batch_worked:
+                break
+            renewed = _now() + timedelta(seconds=lease_time)
+            analyses.update_one({"_id": claim["_id"], "processing_token": token}, {"$set": {
+                "lease_until": renewed, "updated_at": _now(),
+            }})
+            claim["lease_until"] = renewed
         if not worked and not claim.get("total_batches"):
-            _refresh_counts(claim, analyses, batches, requirements, "needs_review", "No relevant source passages were selected.")
+            _refresh_counts(claim, analyses, batches, requirements, "needs_review", "No relevant source passages were selected.", chunks=chunks)
         else:
-            _refresh_counts(claim, analyses, batches, requirements)
+            _refresh_counts(claim, analyses, batches, requirements, chunks=chunks)
         latest = analyses.find_one({"_id": claim["_id"]})
         return _public_analysis(latest, requirements) | {"in_progress": False}
     except AnalysisPaused as error:
@@ -1451,7 +1754,7 @@ def _advance(analysis, analyses, batches, requirements, pages, chunks):
         active_batch = batches.find_one({"analysis_id": claim["_id"], "status": "processing"})
         if active_batch:
             batches.update_one({"_id": active_batch["_id"]}, {"$set": {
-                "status": "pending", "error_message": str(error), "updated_at": paused_at,
+                "status": "pending", "error_message": str(error), "last_activity_at": paused_at, "updated_at": paused_at,
                 "retry_after_seconds": error.retry_after,
             }})
         analyses.update_one({"_id": claim["_id"], "processing_token": token}, {
@@ -1466,13 +1769,13 @@ def _advance(analysis, analyses, batches, requirements, pages, chunks):
         active_batch = batches.find_one({"analysis_id": claim["_id"], "status": "processing"})
         if active_batch:
             message = str(error) if isinstance(error, AnalysisError) else "Could not save this analysis batch. Resume analysis to retry."
-            batches.update_one({"_id": active_batch["_id"]}, {"$set": {"status": "failed", "error_message": message, "updated_at": _now()}})
+            batches.update_one({"_id": active_batch["_id"]}, {"$set": {"status": "failed", "error_message": message, "last_activity_at": _now(), "updated_at": _now()}})
         message = str(error) if isinstance(error, AnalysisError) else "Could not save this analysis batch. Resume analysis to retry."
-        _refresh_counts(claim, analyses, batches, requirements, "failed", message)
+        _refresh_counts(claim, analyses, batches, requirements, "failed", message, chunks=chunks)
         return _public_analysis(analyses.find_one({"_id": claim["_id"]}), requirements)
     except Exception:
         active_batch = batches.find_one({"analysis_id": claim["_id"], "status": "processing"})
         if active_batch:
-            batches.update_one({"_id": active_batch["_id"]}, {"$set": {"status": "failed", "error_message": "Analysis batch failed unexpectedly.", "updated_at": _now()}})
-        _refresh_counts(claim, analyses, batches, requirements, "failed", "Analysis batch failed unexpectedly. Resume to retry.")
+            batches.update_one({"_id": active_batch["_id"]}, {"$set": {"status": "failed", "error_message": "Analysis batch failed unexpectedly.", "last_activity_at": _now(), "updated_at": _now()}})
+        _refresh_counts(claim, analyses, batches, requirements, "failed", "Analysis batch failed unexpectedly. Resume to retry.", chunks=chunks)
         return _public_analysis(analyses.find_one({"_id": claim["_id"]}), requirements)
