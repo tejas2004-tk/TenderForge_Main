@@ -2,7 +2,7 @@ import sys
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from config import _effective_gemini_model
+from config import _effective_gemini_model, _provider_order
 
 
 class GeminiModelConfigurationTests(unittest.TestCase):
@@ -28,6 +28,14 @@ class GeminiModelConfigurationTests(unittest.TestCase):
 
     def test_dotenv_model_is_used_when_environment_has_no_model(self):
         self.assertEqual(_effective_gemini_model("gemini-from-dotenv", {}, False), "gemini-from-dotenv")
+
+    def test_provider_order_defaults_to_approved_priority(self):
+        self.assertEqual(_provider_order(None), ["groq", "openrouter", "gemini"])
+
+    def test_provider_order_rejects_duplicates_and_unknown_names(self):
+        for value in ("groq,groq", "openai,gemini", ""):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _provider_order(value)
 
 
 if __name__ == "__main__":

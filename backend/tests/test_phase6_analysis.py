@@ -37,6 +37,9 @@ class MemoryCollection:
             if key == "$or":
                 if not any(self._matches(row, condition) for condition in value):
                     return False
+            elif key == "$and":
+                if not all(self._matches(row, condition) for condition in value):
+                    return False
             elif isinstance(value, dict):
                 if "$in" in value and row.get(key) not in value["$in"]:
                     return False
@@ -242,6 +245,10 @@ class Phase6AnalysisTests(unittest.TestCase):
         }):
             requested = service._request_output_budget({"estimated_output_tokens": 100})
             self.assertEqual(requested, 2400)
+            split_requested = service._request_output_budget(
+                {"estimated_output_tokens": 100, "subdivision_depth": 1}
+            )
+            self.assertLess(split_requested, requested)
             self.assertEqual(service._tpm_output_budget(5893, requested), 2107)
 
     def test_timeout_is_retried_with_bounded_backoff(self):
@@ -360,8 +367,191 @@ class Phase6AnalysisTests(unittest.TestCase):
                 {"analysis_version": "7", "user_id": "u", "tender_id": "t", "file_hash": "h"},
                 {"page_count": 1, "extracted_pages": 1},
             )
-        self.assertEqual(record["provider"], "gemini")
-        self.assertEqual(record["model_id"], "gemini-test-model")
+        self.assertEqual(record["provider_policy_version"], 1)
+        self.assertEqual(record["provider_order"], ["groq", "openrouter", "gemini"])
+        self.assertEqual(record["provider_models"]["gemini"], "gemini-test-model")
+        self.assertEqual(record["provider_models"]["groq"], "")
+
+    def test_new_policy_run_fails_over_and_persists_provider_attempts(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "explicit-model", "openrouter": "openai/gpt-oss-120b"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": "5", "estimated_output_tokens": 300}
+        analyses, batches = MemoryCollection([analysis]), MemoryCollection([batch])
+        good = SimpleNamespace(
+            provider="openrouter", model="openai/gpt-oss-120b",
+            content='{"overview":{},"requirements":[]}', finish_reason="stop",
+            input_tokens=10, output_tokens=20, total_tokens=30, latency_ms=12.0,
+            http_status=200, request_id="request-1",
+        )
+        with patch.dict(service.current_app.config, {
+            "GROQ_API_KEY": "groq-test", "OPENROUTER_API_KEY": "router-test",
+            "ANALYSIS_MAX_OUTPUT_TOKENS": 400, "ANALYSIS_MAX_TPM_TOKENS": 800,
+        }), patch.object(service, "request_groq", side_effect=service.ProviderRequestError(
+            "groq", "http_error", "busy", status_code=503)), patch.object(
+            service, "request_openrouter", return_value=good,
+        ) as router:
+            result = service._provider_request(
+                [{"role": "user", "content": "source"}], analysis, batch, analyses, batches, "lease",
+            )
+        self.assertEqual(service._response_text(result[0]), '{"overview":{},"requirements":[]}')
+        self.assertEqual(batches.rows[0]["provider"], "openrouter")
+        self.assertEqual(batches.rows[0]["model_id"], "openai/gpt-oss-120b")
+        attempts = batches.rows[0]["api_attempts"]
+        self.assertEqual([item["provider"] for item in attempts], ["groq", "openrouter"])
+        self.assertEqual(analyses.rows[0]["selected_provider"], "openrouter")
+        self.assertNotIn("router-test", repr(attempts))
+        router.assert_called_once()
+
+    def test_groq_http_200_reasoning_only_falls_back_without_persisting_reasoning(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "openai/gpt-oss-120b", "openrouter": "openai/gpt-oss-120b"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": "5", "estimated_output_tokens": 300}
+        analyses, batches = MemoryCollection([analysis]), MemoryCollection([batch])
+        good = SimpleNamespace(
+            provider="openrouter", model="openai/gpt-oss-120b",
+            content='{"overview":{},"requirements":[]}', finish_reason="stop",
+            input_tokens=10, output_tokens=20, total_tokens=30, latency_ms=12.0,
+            http_status=200, request_id="router-1", reasoning_present=False,
+        )
+        with patch.dict(service.current_app.config, {
+            "GROQ_API_KEY": "groq-test", "OPENROUTER_API_KEY": "router-test",
+            "ANALYSIS_MAX_OUTPUT_TOKENS": 400, "ANALYSIS_MAX_TPM_TOKENS": 800,
+        }), patch.object(service, "request_groq", side_effect=service.ProviderRequestError(
+            "groq", "reasoning_only_response", "Provider returned no usable message content",
+            status_code=200, finish_reason="stop", input_tokens=5, output_tokens=9,
+            total_tokens=14, request_id="groq-1", reasoning_present=True,
+        )), patch.object(service, "request_openrouter", return_value=good) as router:
+            result = service._provider_request(
+                [{"role": "user", "content": "prompt"}], analysis, batch, analyses, batches, "lease",
+            )
+        attempts = batches.rows[0]["api_attempts"]
+        self.assertEqual([item["provider"] for item in attempts], ["groq", "openrouter"])
+        self.assertEqual(attempts[0]["provider_http_status"], 200)
+        self.assertEqual(attempts[0]["finish_reason"], "stop")
+        self.assertEqual(attempts[0]["provider_total_tokens"], 14)
+        self.assertTrue(attempts[0]["reasoning_present"])
+        self.assertNotIn("reasoning text", repr(attempts))
+        self.assertEqual(service._response_text(result[0]), '{"overview":{},"requirements":[]}')
+        router.assert_called_once()
+
+    def test_groq_valid_http_200_content_is_returned_without_fallback(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "openai/gpt-oss-120b", "openrouter": "m"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": "5", "estimated_output_tokens": 300}
+        good = SimpleNamespace(
+            provider="groq", model="openai/gpt-oss-120b", content='{"overview":{},"requirements":[]}',
+            finish_reason="stop", input_tokens=10, output_tokens=20, total_tokens=30,
+            latency_ms=8.0, http_status=200, request_id="groq-ok", reasoning_present=True,
+        )
+        with patch.dict(service.current_app.config, {
+            "GROQ_API_KEY": "groq-test", "OPENROUTER_API_KEY": "router-test",
+            "ANALYSIS_MAX_OUTPUT_TOKENS": 400, "ANALYSIS_MAX_TPM_TOKENS": 800,
+        }), patch.object(service, "request_groq", return_value=good) as groq, \
+             patch.object(service, "request_openrouter") as fallback:
+            result = service._provider_request(
+                [{"role": "user", "content": "prompt"}], analysis, batch,
+                MemoryCollection([analysis]), MemoryCollection([batch]), "lease",
+            )
+        self.assertEqual(service._response_text(result[0]), '{"overview":{},"requirements":[]}')
+        self.assertEqual(groq.call_args.kwargs["max_output_tokens"], 400)
+        fallback.assert_not_called()
+
+    def test_new_policy_429_moves_immediately_to_next_provider_once(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "openai/gpt-oss-120b", "openrouter": "m"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": "5", "estimated_output_tokens": 300}
+        good = SimpleNamespace(
+            provider="openrouter", model="m", content='{"overview":{},"requirements":[]}',
+            finish_reason="stop", input_tokens=1, output_tokens=1, total_tokens=2,
+            latency_ms=1.0, http_status=200, request_id="r2", reasoning_present=False,
+        )
+        with patch.dict(service.current_app.config, {
+            "GROQ_API_KEY": "g", "OPENROUTER_API_KEY": "o",
+            "ANALYSIS_MAX_OUTPUT_TOKENS": 400, "ANALYSIS_MAX_TPM_TOKENS": 800,
+        }), patch.object(service, "request_groq", side_effect=service.ProviderRequestError(
+            "groq", "http_error", "limited", status_code=429, retry_after_seconds=120,
+        )) as groq, patch.object(service, "request_openrouter", return_value=good) as router:
+            service._provider_request([{"role": "user", "content": "prompt"}], analysis, batch,
+                                     MemoryCollection([analysis]), MemoryCollection([batch]), "lease")
+        groq.assert_called_once()
+        router.assert_called_once()
+
+    def test_truncated_empty_groq_content_reaches_truncation_handler_contract(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "openai/gpt-oss-120b", "openrouter": "m"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": "5", "estimated_output_tokens": 300}
+        truncated = SimpleNamespace(
+            provider="groq", model="openai/gpt-oss-120b", content="", finish_reason="length",
+            input_tokens=20, output_tokens=100, total_tokens=120, latency_ms=5.0,
+            http_status=200, request_id="truncated", reasoning_present=True,
+        )
+        with patch.dict(service.current_app.config, {
+            "GROQ_API_KEY": "g", "OPENROUTER_API_KEY": "o",
+            "ANALYSIS_MAX_OUTPUT_TOKENS": 400, "ANALYSIS_MAX_TPM_TOKENS": 800,
+        }), patch.object(service, "request_groq", return_value=truncated), \
+             patch.object(service, "request_openrouter") as fallback:
+            result = service._provider_request([{"role": "user", "content": "prompt"}], analysis, batch,
+                                               MemoryCollection([analysis]), MemoryCollection([batch]), "lease")
+        self.assertEqual(service._response_text(result[0]), "")
+        self.assertEqual(service._response_finish_reason(result[0]), "MAX_TOKENS")
+        self.assertEqual(result[1:6], (service._estimate_tokens("prompt"), 20, 100, None, 120))
+        fallback.assert_not_called()
+
+    def test_empty_groq_length_response_splits_batch_without_findings(self):
+        result = SimpleNamespace(
+            provider="groq", model="openai/gpt-oss-120b", content="", finish_reason="length",
+            input_tokens=20, output_tokens=100, total_tokens=120, latency_ms=5.0,
+            http_status=200, request_id="truncated", reasoning_present=True,
+        )
+        analysis, batch, analyses, batches, pages, chunks, _ = self._batch_inputs(None)
+        analysis.update({"provider_policy_version": 1, "provider_order": ["groq", "openrouter"],
+                         "provider_models": {"groq": "openai/gpt-oss-120b", "openrouter": "m"}})
+        batch["chunk_refs"] = [{"chunk_index": 1, "page_number": 1}, {"chunk_index": 2, "page_number": 2}]
+        batches.rows[0]["chunk_refs"] = list(batch["chunk_refs"])
+        chunks.rows.append({"chunk_index": 2, "page_number": 2, "text": "Page two source.",
+                            "user_id": "user", "tender_id": "tender", "file_hash": "hash"})
+        pages.rows.append({"page_number": 2, "part_index": 0, "complete": True, "text": "Page two source."})
+        requirements = MemoryCollection()
+        with patch.dict(service.current_app.config, {"GROQ_API_KEY": "test", "ANALYSIS_MAX_OUTPUT_TOKENS": 1400}), \
+             patch.object(service, "request_groq", return_value=result), \
+             patch.object(service, "request_openrouter") as fallback:
+            self.assertTrue(service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks))
+        self.assertEqual(batches.rows[0]["status"], "split")
+        self.assertEqual(batches.rows[0]["finish_reason"], "MAX_TOKENS")
+        self.assertEqual(requirements.rows, [])
+        children = [row for row in batches.rows if row.get("parent_batch_id") == "batch"]
+        self.assertEqual(len(children), 2)
+        fallback.assert_not_called()
+
+    def test_new_policy_auth_failure_stops_without_fallback(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "explicit-model", "openrouter": "m"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": "5", "estimated_output_tokens": 300}
+        with patch.dict(service.current_app.config, {"GROQ_API_KEY": "g", "OPENROUTER_API_KEY": "o"}), \
+             patch.object(service, "request_groq", side_effect=service.ProviderRequestError(
+                 "groq", "authentication", "unauthorized", status_code=401)), \
+             patch.object(service, "request_openrouter") as fallback:
+            with self.assertRaises(service.AnalysisError):
+                service._provider_request([{"role": "user", "content": "prompt"}], analysis, batch,
+                                          MemoryCollection([analysis]), MemoryCollection([batch]), "lease")
+        fallback.assert_not_called()
+
+    def test_uncertain_timeout_pauses_and_pins_same_provider_for_resume(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "explicit-model", "openrouter": "m"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": "5", "estimated_output_tokens": 300}
+        batches = MemoryCollection([batch])
+        with patch.dict(service.current_app.config, {"GROQ_API_KEY": "g", "OPENROUTER_API_KEY": "o"}), \
+             patch.object(service, "request_groq", side_effect=service.ProviderRequestError(
+                 "groq", "timeout_uncertain", "timed out", request_may_have_completed=True)), \
+             patch.object(service, "request_openrouter") as fallback:
+            with self.assertRaises(service.AnalysisPaused) as caught:
+                service._provider_request([{"role": "user", "content": "prompt"}], analysis, batch,
+                                          MemoryCollection([analysis]), batches, "lease")
+        self.assertEqual(caught.exception.reason, "uncertain_timeout")
+        self.assertEqual(batches.rows[0]["preferred_provider"], "groq")
+        self.assertTrue(batches.rows[0]["uncertain_timeout_pending"])
+        fallback.assert_not_called()
 
     def test_legacy_groq_analysis_remains_readable_and_cannot_resume(self):
         user = {"_id": "user"}
@@ -537,12 +727,14 @@ class Phase6AnalysisTests(unittest.TestCase):
         )
         analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result)
         requirements = MemoryCollection()
-        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
+        with patch.dict(service.current_app.config, {"ANALYSIS_MIN_SEGMENT_CHARS": 1}), \
+                patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
             self.assertTrue(service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks))
         saved = analyses.rows[0]
         self.assertEqual((saved["request_count"], saved["actual_input_tokens"], saved["actual_output_tokens"]), (1, 44, 12))
         self.assertEqual(requirements.rows, [])
-        self.assertEqual(batches.rows[0]["status"], "manual_review")
+        self.assertEqual(batches.rows[0]["status"], "split")
+        self.assertEqual(len([row for row in batches.rows if row.get("parent_batch_id") == "batch"]), 2)
         self.assertEqual(batches.rows[0]["failure_category"], "incomplete_json")
 
     def test_advance_marks_malformed_batch_failed_and_resume_eligible(self):
@@ -558,16 +750,15 @@ class Phase6AnalysisTests(unittest.TestCase):
             choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"overview": {}, "requirements": []}'))],
             usage=SimpleNamespace(prompt_tokens=44, completion_tokens=10),
         )
-        client.models.generate_content.side_effect = [result, recovered]
-        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
+        client.models.generate_content.side_effect = [result, recovered, recovered]
+        with patch.dict(service.current_app.config, {"ANALYSIS_MIN_SEGMENT_CHARS": 1}), \
+                patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
             response = service._advance(analyses.rows[0], analyses, batches, requirements, pages, chunks)
             self.assertEqual(response["status"], "needs_review")
-            self.assertEqual(batches.rows[0]["status"], "manual_review")
+            self.assertEqual(batches.rows[0]["status"], "split")
             self.assertIsNone(analyses.rows[0].get("processing_token"))
-            response = service._advance(analyses.rows[0], analyses, batches, requirements, pages, chunks)
         self.assertEqual(response["status"], "needs_review")
-        self.assertEqual(batches.rows[0]["status"], "completed")
-        self.assertEqual(batches.rows[0]["manual_review_retry_count"], 1)
+        self.assertTrue(all(row["status"] == "completed" for row in batches.rows if row.get("parent_batch_id") == "batch"))
 
     def test_truncated_response_is_failed_before_findings_are_saved(self):
         result = SimpleNamespace(
@@ -625,7 +816,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(batches.rows[1]["prompt_version"], "5")
         self.assertFalse(batches.rows[1]["is_overview_batch"])
 
-    def test_resume_retries_only_manual_child_and_preserves_completed_findings(self):
+    def test_resume_subdivides_manual_child_and_preserves_completed_findings(self):
         evidence = "The bidder must have supplied similar equipment for 3 years."
         result = SimpleNamespace(
             candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
@@ -663,6 +854,7 @@ class Phase6AnalysisTests(unittest.TestCase):
             "api_call_count": 1, "finish_reason": "MAX_TOKENS",
             "manual_review_reason": "output_truncated_single_reference",
             "chunk_refs": [{"chunk_index": 2, "page_number": 1}],
+            "analysis_work_policy": {"max_split_depth": 2, "min_segment_chars": 1},
             "prompt_version": "5", "is_overview_batch": False,
         }
         batches = MemoryCollection([completed, manual])
@@ -682,13 +874,14 @@ class Phase6AnalysisTests(unittest.TestCase):
         fake_client.models.generate_content.return_value = result
         with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
             service._advance(analyses.rows[0], analyses, batches, requirements, pages, chunks)
-        self.assertEqual(fake_client.models.generate_content.call_count, 1)
+        self.assertEqual(fake_client.models.generate_content.call_count, 2)
         completed_saved = next(row for row in batches.rows if row["_id"] == "completed")
         manual_saved = next(row for row in batches.rows if row["_id"] == "manual-child")
         self.assertEqual(completed_saved["status"], "completed")
         self.assertEqual(completed_saved["api_call_count"], 1)
-        self.assertEqual(manual_saved["status"], "completed")
+        self.assertEqual(manual_saved["status"], "split")
         self.assertEqual(manual_saved["manual_review_retry_count"], 1)
+        self.assertEqual(len([row for row in batches.rows if row.get("parent_batch_id") == "manual-child"]), 2)
         self.assertEqual(len(requirements.rows), 1)
         self.assertEqual(
             {row["evidence_text"] for row in requirements.rows[0]["source_evidence"]},
@@ -736,6 +929,61 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(total, 1)
         self.assertTrue(batches.rows[0]["is_overview_batch"])
         self.assertEqual(batches.rows[0]["prompt_version"], "4")
+
+    def test_universal_planner_covers_long_paragraph_table_and_scanned_page_idempotently(self):
+        paragraph = "The bidder shall submit the certificate with the tender. " * 900
+        table = "| Item | Eligibility condition | Evidence |\n|---|---|---|\n" + (
+            "| Bidder | shall provide a valid certificate | certificate copy |\n" * 700
+        )
+        analysis = {"_id": "synthetic", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        chunks = MemoryCollection([
+            {"user_id": "user", "tender_id": "tender", "file_hash": "hash", "chunk_index": 1,
+             "page_number": 1, "text": paragraph, "char_start": 0, "char_end": len(paragraph)},
+            {"user_id": "user", "tender_id": "tender", "file_hash": "hash", "chunk_index": 2,
+             "page_number": 2, "text": table, "char_start": 0, "char_end": len(table)},
+            {"user_id": "user", "tender_id": "tender", "file_hash": "hash", "chunk_index": 3,
+             "page_number": 3, "text": "", "char_start": 0, "char_end": 0},
+        ])
+        batches = MemoryCollection()
+        with patch.dict(service.current_app.config, {
+            "ANALYSIS_MAX_INPUT_TOKENS": 4500, "ANALYSIS_MAX_OUTPUT_TOKENS": 1000,
+            "ANALYSIS_BATCH_TARGET_OUTPUT_TOKENS": 800, "ANALYSIS_MIN_SEGMENT_CHARS": 80,
+        }):
+            first_total, _ = service._plan_batches(analysis, batches, chunks, page_count=3)
+            first_ids = {row["_id"] for row in batches.rows}
+            second_total, _ = service._plan_batches(analysis, batches, chunks, page_count=3)
+        self.assertGreater(first_total, 2)
+        self.assertEqual(second_total, first_total)
+        self.assertEqual({row["_id"] for row in batches.rows}, first_ids)
+        for index, text in ((1, paragraph), (2, table)):
+            ranges = sorted(
+                (ref["text_start"], ref["text_end"], ref["source_start"], ref["source_end"])
+                for row in batches.rows for ref in row.get("chunk_refs", [])
+                if ref["chunk_index"] == index
+            )
+            self.assertEqual(ranges[0][0], 0)
+            self.assertEqual(ranges[-1][1], len(text))
+            self.assertTrue(all(left[1] == right[0] for left, right in zip(ranges, ranges[1:])))
+            self.assertTrue(all(item[2] == item[0] and item[3] == item[1] for item in ranges))
+        self.assertFalse(any(ref["page_number"] == 3 for row in batches.rows for ref in row.get("chunk_refs", [])))
+
+    def test_batch_claim_honors_retry_deadline_and_terminal_provider_failure(self):
+        now = service._now()
+        analysis = {"_id": "analysis", "provider_policy_version": 1,
+                    "provider_order": ["groq", "openrouter", "gemini"]}
+        batches = MemoryCollection([
+            {"_id": "future", "analysis_id": "analysis", "status": "retrying",
+             "retry_at": now + timedelta(minutes=1), "provider_window_attempt_count": 1},
+            {"_id": "terminal", "analysis_id": "analysis", "status": "failed",
+             "terminal_failure": True, "provider_window_attempt_count": 1},
+            {"_id": "due", "analysis_id": "analysis", "status": "retrying",
+             "retry_at": now - timedelta(seconds=1), "provider_window_attempt_count": 1},
+        ])
+        claimed = batches.find_one_and_update(service._batch_claim_query(analysis, now, 3),
+                                               {"$set": {"status": "processing"}})
+        self.assertEqual(claimed["_id"], "due")
+        self.assertEqual(batches.find_one({"_id": "future"})["status"], "retrying")
+        self.assertEqual(batches.find_one({"_id": "terminal"})["status"], "failed")
 
     def test_advance_drains_all_claimable_batches_in_one_call(self):
         analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender",
@@ -829,15 +1077,85 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(advance.call_count, 1)
         self.assertEqual(advance.call_args.args[0]["_id"], "fresh-run")
 
-    def test_single_reference_truncation_goes_to_manual_review_without_looping(self):
+    def test_single_reference_truncation_splits_to_text_ranges_idempotently(self):
         batch = {"_id": "single", "analysis_id": "analysis", "user_id": "user", "tender_id": "tender",
                  "file_hash": "hash", "batch_index": 0, "chunk_refs": [{"chunk_index": 1, "page_number": 1}],
                  "status": "split_pending"}
         batches = MemoryCollection([batch])
+        chunks = MemoryCollection([{"chunk_index": 1, "page_number": 1, "text": "0123456789",
+                                    "user_id": "user", "tender_id": "tender", "file_hash": "hash"}])
+        batch["analysis_work_policy"] = {"max_split_depth": 2, "min_segment_chars": 1}
+        self.assertEqual(service._split_truncated_batch(batch, batches, chunks), 2)
+        self.assertEqual(service._split_truncated_batch(batches.rows[0], batches, chunks), 2)
+        self.assertEqual(len(batches.rows), 3)
+        self.assertEqual(batches.rows[0]["status"], "split")
+        self.assertEqual(sorted((row["chunk_refs"][0]["text_start"], row["chunk_refs"][0]["text_end"])
+                                for row in batches.rows[1:]), [(0, 5), (5, 10)])
+
+    def test_single_reference_subdivision_is_bounded_to_two_child_levels(self):
+        text = "x" * 1024
+        batch = {"_id": "root", "analysis_id": "analysis", "user_id": "user", "tender_id": "tender",
+                 "file_hash": "hash", "batch_index": 0, "status": "split_pending",
+                 "analysis_work_policy": {"max_split_depth": 2, "min_segment_chars": 100},
+                 "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 0, "text_end": len(text),
+                                 "source_start": 500, "source_end": 500 + len(text)}]}
+        batches = MemoryCollection([batch])
+        chunks = MemoryCollection([{"chunk_index": 1, "page_number": 1, "text": text, "char_start": 500,
+                                    "user_id": "user", "tender_id": "tender", "file_hash": "hash"}])
+        service._split_truncated_batch(batches.rows[0], batches, chunks)
+        level_one = [row for row in batches.rows if row.get("parent_batch_id") == "root"]
+        self.assertEqual(len(level_one), 2)
+        for child in level_one:
+            service._split_truncated_batch(child, batches, chunks)
+        level_two = [row for row in batches.rows if row.get("parent_batch_id") in {row["_id"] for row in level_one}]
+        self.assertEqual(len(level_two), 4)
+        ranges = []
+        for leaf in level_two:
+            self.assertEqual(leaf["subdivision_depth"], 2)
+            service._split_truncated_batch(leaf, batches, chunks)
+            self.assertEqual(leaf["status"], "skipped")
+            ref = leaf["chunk_refs"][0]
+            ranges.append((ref["text_start"], ref["text_end"]))
+        self.assertEqual(sorted(ranges), [(0, 256), (256, 512), (512, 768), (768, 1024)])
+
+    def test_single_reference_split_uses_tender_scoped_source_chunk(self):
+        batch = {"_id": "scoped", "analysis_id": "analysis", "user_id": "u1", "tender_id": "t1",
+                 "file_hash": "h1", "batch_index": 0, "chunk_refs": [{"chunk_index": 7, "page_number": 2}],
+                 "status": "split_pending", "analysis_work_policy": {"max_split_depth": 2, "min_segment_chars": 1}}
+        batches = MemoryCollection([batch])
+        chunks = MemoryCollection([
+            {"chunk_index": 7, "page_number": 2, "text": "abcdefghij", "user_id": "u1", "tender_id": "t1", "file_hash": "h1"},
+            {"chunk_index": 7, "page_number": 2, "text": "x" * 100, "user_id": "u2", "tender_id": "t2", "file_hash": "h2"},
+        ])
+        service._split_truncated_batch(batch, batches, chunks)
+        children = [row for row in batches.rows if row.get("parent_batch_id") == "scoped"]
+        self.assertEqual(sorted(ref["text_end"] for row in children for ref in row["chunk_refs"]), [5, 10])
+
+    def test_out_of_range_saved_segment_is_skipped_without_provider_call(self):
+        analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        batch = {"_id": "bad-range", "analysis_id": "analysis", "user_id": "user", "tender_id": "tender",
+                 "file_hash": "hash", "batch_index": 0, "status": "pending", "attempt_count": 0,
+                 "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 20, "text_end": 40}]}
+        analyses = MemoryCollection([dict(analysis, processing_token="lease")])
+        batches = MemoryCollection([batch])
+        chunks = MemoryCollection([{"chunk_index": 1, "page_number": 1, "text": "short text",
+                                    "user_id": "user", "tender_id": "tender", "file_hash": "hash"}])
+        with patch.object(service, "_provider_request") as provider:
+            self.assertTrue(service._process_batch(analysis, "lease", analyses, batches,
+                                                   MemoryCollection(), MemoryCollection(), chunks))
+        self.assertEqual(batches.rows[0]["status"], "skipped")
+        self.assertIn("outside", batches.rows[0]["skipped_reason"])
+        provider.assert_not_called()
+
+    def test_smallest_segment_is_skipped_at_subdivision_limit(self):
+        batch = {"_id": "tiny", "analysis_id": "analysis", "user_id": "user", "tender_id": "tender",
+                 "file_hash": "hash", "batch_index": 0, "subdivision_depth": service.MAX_TEXT_SUBDIVISION_DEPTH,
+                 "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 0, "text_end": 2}],
+                 "status": "split_pending"}
+        batches = MemoryCollection([batch])
         self.assertEqual(service._split_truncated_batch(batch, batches), 0)
-        self.assertEqual(service._split_truncated_batch(batches.rows[0], batches), 0)
-        self.assertEqual(len(batches.rows), 1)
-        self.assertEqual(batches.rows[0]["status"], "manual_review")
+        self.assertEqual(batches.rows[0]["status"], "skipped")
+        self.assertEqual(batches.rows[0]["skipped_text_ranges"][0]["text_end"], 2)
 
     def test_fallback_cooldown_is_persisted_and_resume_waits_until_expiry(self):
         analysis = {"_id": "analysis", "status": "pending", "plan_ready": True, "total_batches": 1,
@@ -1288,7 +1606,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertTrue(all(c["status"] == "pending" for c in children))
         self.assertEqual({c["chunk_refs"][0]["page_number"] for c in children}, {1, 2})
 
-    def test_truncated_findings_are_preserved_as_preliminary_without_completing_batch(self):
+    def test_truncated_response_does_not_create_findings_from_incomplete_json(self):
         # Recovered fragments remain reviewable and never complete their parent batch.
         partial_json = (
             '{"overview": {"tender_title": "Function Generator"}, '
@@ -1312,14 +1630,9 @@ class Phase6AnalysisTests(unittest.TestCase):
         with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
             service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
 
-        self.assertEqual(len(requirements.rows), 1)
-        self.assertTrue(requirements.rows[0]["preliminary"])
-        self.assertEqual(batches.rows[0]["partial_requirement_count"], 1)
+        self.assertEqual(requirements.rows, [])
+        self.assertEqual(batches.rows[0]["partial_requirement_count"], 0)
         self.assertNotEqual(batches.rows[0]["status"], "completed")
-        partial = service._extract_partial_response(partial_json)[1]
-        service._save_requirements(partial, analysis, batch, pages, requirements, preliminary=True)
-        self.assertEqual(len(requirements.rows), 1)
-        self.assertEqual(len(requirements.rows[0]["source_evidence"]), 1)
 
     def test_interrupted_batch_recovery(self):
         analysis = {"_id": "analysis", "status": "processing", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
@@ -1394,13 +1707,13 @@ class Phase6AnalysisTests(unittest.TestCase):
         analyses = MemoryCollection([dict(analysis)])
         requirements = MemoryCollection()
         chunks = MemoryCollection([
-            {"page_number": 1, "text": "Text 1", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
-            {"page_number": 2, "text": "Text 2", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"chunk_index": 1, "page_number": 1, "text": "Text 1", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"chunk_index": 2, "page_number": 2, "text": "Text 2", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
         ])
 
         # Case A: Batch 0 completed, Batch 1 pending -> status must be 'processing', NOT 'completed'
-        b0 = {"_id": "b0", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 1}]}
-        b1 = {"_id": "b1", "analysis_id": "analysis", "status": "pending", "chunk_refs": [{"page_number": 2}]}
+        b0 = {"_id": "b0", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"chunk_index": 1, "page_number": 1}]}
+        b1 = {"_id": "b1", "analysis_id": "analysis", "status": "pending", "chunk_refs": [{"chunk_index": 2, "page_number": 2}]}
         batches = MemoryCollection([b0, b1])
         status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
         self.assertEqual(status, "processing")
@@ -1438,16 +1751,16 @@ class Phase6AnalysisTests(unittest.TestCase):
         analysis = {"_id": "analysis", "total_processing_ms": 0, "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
         analyses = MemoryCollection([dict(analysis)])
         chunks = MemoryCollection([
-            {"page_number": 1, "text": "Text 1", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
-            {"page_number": 2, "text": "Text 2", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
-            {"page_number": 3, "text": "Text 3", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"chunk_index": 1, "page_number": 1, "text": "Text 1", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"chunk_index": 2, "page_number": 2, "text": "Text 2", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
+            {"chunk_index": 3, "page_number": 3, "text": "Text 3", "user_id": "user", "tender_id": "tender", "file_hash": "hash"},
         ])
         req = {"_id": "r1", "analysis_id": "analysis", "validation_status": "verified", "eligible_for_phase7": True}
         requirements = MemoryCollection([req])
 
         # Only pages 1 and 2 completed; page 3 has not completed
-        b0 = {"_id": "b0", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 1}]}
-        b1 = {"_id": "b1", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 2}]}
+        b0 = {"_id": "b0", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"chunk_index": 1, "page_number": 1}]}
+        b1 = {"_id": "b1", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"chunk_index": 2, "page_number": 2}]}
         batches = MemoryCollection([b0, b1])
 
         status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
@@ -1458,7 +1771,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(analyses.rows[0]["coverage"]["unexamined_page_numbers"], [3])
 
         # Now page 3 batch completes
-        b2 = {"_id": "b2", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"page_number": 3}]}
+        b2 = {"_id": "b2", "analysis_id": "analysis", "status": "completed", "chunk_refs": [{"chunk_index": 3, "page_number": 3}]}
         batches.rows.append(b2)
 
         status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
@@ -1466,6 +1779,41 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(status, "completed")
         self.assertTrue(analyses.rows[0]["coverage"]["complete"])
         self.assertEqual(analyses.rows[0]["coverage"]["unexamined_pages"], 0)
+
+    def test_skipped_leaf_finishes_with_warnings_and_discloses_text_coverage(self):
+        analysis = {"_id": "analysis", "total_processing_ms": 0, "user_id": "user",
+                    "tender_id": "tender", "file_hash": "hash"}
+        analyses = MemoryCollection([dict(analysis)])
+        chunks = MemoryCollection([{"chunk_index": 1, "page_number": 1, "text": "0123456789",
+                                    "user_id": "user", "tender_id": "tender", "file_hash": "hash"}])
+        batches = MemoryCollection([
+            {"_id": "parent", "analysis_id": "analysis", "status": "split",
+             "chunk_refs": [{"chunk_index": 1, "page_number": 1}]},
+            {"_id": "done-a", "analysis_id": "analysis", "status": "completed",
+             "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 0, "text_end": 4}]},
+            {"_id": "skipped", "analysis_id": "analysis", "status": "skipped",
+             "skipped_reason": "Output limit", "skipped_text_ranges": [{"page_number": 1, "text_start": 4, "text_end": 6}],
+             "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 4, "text_end": 6}]},
+            {"_id": "done-b", "analysis_id": "analysis", "status": "completed",
+             "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 6, "text_end": 10}]},
+        ])
+        requirements = MemoryCollection()
+        status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
+        self.assertEqual(status, "completed_with_warnings")
+        self.assertFalse(analyses.rows[0]["coverage"]["complete"])
+        self.assertEqual(analyses.rows[0]["coverage"]["text_covered_chars"], 8)
+        self.assertEqual(analyses.rows[0]["coverage"]["text_skipped_chars"], 2)
+        public = service._public_analysis(analyses.rows[0], requirements, batches)
+        self.assertEqual(public["progress"]["completed_batches"], 2)
+        self.assertEqual(public["progress"]["skipped_batches"], 1)
+        self.assertEqual(public["skipped_passages"][0]["reason"], "Output limit")
+        analyses.rows[0]["provider_policy_version"] = 1
+        with patch.object(service, "_process_batch") as process:
+            resumed = service._advance(analyses.rows[0], analyses, batches, requirements,
+                                       MemoryCollection(), chunks)
+        process.assert_not_called()
+        self.assertEqual(resumed["status"], "completed_with_warnings")
+        self.assertEqual(resumed["progress"]["skipped_batches"], 1)
 
 
 if __name__ == "__main__":

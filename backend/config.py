@@ -18,6 +18,15 @@ def _effective_gemini_model(dotenv_model, environment=None, local_development=Fa
     return environment.get("GEMINI_MODEL") or dotenv_model or "gemini-3.8-flash"
 
 
+def _provider_order(value):
+    value = "groq,openrouter,gemini" if value is None else value
+    providers = [item.strip().casefold() for item in value.split(",") if item.strip()]
+    allowed = {"groq", "openrouter", "gemini"}
+    if not providers or any(item not in allowed for item in providers) or len(set(providers)) != len(providers):
+        raise ValueError("ANALYSIS_PROVIDER_ORDER must be a unique comma-separated list of groq,openrouter,gemini.")
+    return providers
+
+
 class Config:
     MONGODB_URI = os.getenv("MONGODB_URI", "")
     MONGODB_DATABASE = os.getenv("MONGODB_DATABASE", "tenderforge")
@@ -29,6 +38,16 @@ class Config:
     )
     LOCAL_DEVELOPMENT = TENDERFORGE_ENV == "development" or (not TENDERFORGE_ENV and DEBUG)
     GEMINI_MODEL = _effective_gemini_model(_DOTENV_VALUES.get("GEMINI_MODEL"), local_development=LOCAL_DEVELOPMENT)
+    ANALYSIS_PROVIDER_ORDER = _provider_order(os.getenv("ANALYSIS_PROVIDER_ORDER", "groq,openrouter,gemini"))
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "")
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-oss-120b")
+    OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+    OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "TenderForge")
+    ANALYSIS_PROVIDER_TIMEOUT_SECONDS = float(os.getenv("ANALYSIS_PROVIDER_TIMEOUT_SECONDS", "30"))
+    ANALYSIS_PROVIDER_CONNECT_TIMEOUT_SECONDS = float(os.getenv("ANALYSIS_PROVIDER_CONNECT_TIMEOUT_SECONDS", "10"))
     GEMINI_CONNECTION_TIMEOUT_MS = int(os.getenv("GEMINI_CONNECTION_TIMEOUT_MS", "90000"))
     GEMINI_CONNECTION_RETRY_ATTEMPTS = int(os.getenv("GEMINI_CONNECTION_RETRY_ATTEMPTS", "3"))
     GEMINI_CONNECTION_RETRY_BASE_SECONDS = float(os.getenv("GEMINI_CONNECTION_RETRY_BASE_SECONDS", "1"))
@@ -46,10 +65,14 @@ class Config:
     ANALYSIS_MAX_INPUT_TOKENS = int(os.getenv("ANALYSIS_MAX_INPUT_TOKENS", "6000"))
     ANALYSIS_MAX_OUTPUT_TOKENS = int(os.getenv("ANALYSIS_MAX_OUTPUT_TOKENS", "4000"))
     ANALYSIS_MAX_TPM_TOKENS = int(os.getenv("ANALYSIS_MAX_TPM_TOKENS", "8000"))
+    ANALYSIS_BATCH_TARGET_OUTPUT_TOKENS = int(os.getenv("ANALYSIS_BATCH_TARGET_OUTPUT_TOKENS", "1600"))
+    ANALYSIS_MIN_SEGMENT_CHARS = int(os.getenv("ANALYSIS_MIN_SEGMENT_CHARS", "120"))
+    ANALYSIS_MAX_SPLIT_DEPTH = int(os.getenv("ANALYSIS_MAX_SPLIT_DEPTH", "2"))
     ANALYSIS_REQUEST_INTERVAL_SECONDS = float(os.getenv("ANALYSIS_REQUEST_INTERVAL_SECONDS", "2"))
     ANALYSIS_RETRY_ATTEMPTS = int(os.getenv("ANALYSIS_RETRY_ATTEMPTS", "3"))
     ANALYSIS_RETRY_BASE_SECONDS = float(os.getenv("ANALYSIS_RETRY_BASE_SECONDS", "2"))
     ANALYSIS_RATE_LIMIT_FALLBACK_SECONDS = float(os.getenv("ANALYSIS_RATE_LIMIT_FALLBACK_SECONDS", "60"))
+    ANALYSIS_PROVIDER_MAX_COOLDOWN_SECONDS = float(os.getenv("ANALYSIS_PROVIDER_MAX_COOLDOWN_SECONDS", "300"))
     ANALYSIS_DAILY_QUOTA_FALLBACK_SECONDS = float(os.getenv("ANALYSIS_DAILY_QUOTA_FALLBACK_SECONDS", "86400"))
     ANALYSIS_LEASE_SECONDS = int(os.getenv("ANALYSIS_LEASE_SECONDS", "300"))
     ANALYSIS_VERSION = os.getenv("ANALYSIS_VERSION", "6")

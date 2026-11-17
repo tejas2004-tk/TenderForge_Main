@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from re import sub
 from uuid import uuid4
+from types import SimpleNamespace
 
 from flask import current_app
 from google import genai
@@ -20,9 +21,13 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from database import get_database
 from services.tender_service import TenderError, _find_owned_tender
+from services.provider_service import ProviderRequestError, request_gemini, request_groq, request_openrouter
 
 ANALYSIS_VERSION = "6"
 PROMPT_VERSION = "5"
+# Retained as a compatibility alias for older tests and callers; persisted run
+# policy is authoritative for new work.
+MAX_TEXT_SUBDIVISION_DEPTH = 2
 CATEGORY_NAMES = (
     "Tender Overview", "Eligibility Requirements", "Financial Requirements",
     "Technical Requirements", "Product and Equipment Specifications", "Experience Requirements", "Required Documents and Certificates",
@@ -97,10 +102,11 @@ class AnalysisResponseError(AnalysisError):
 
 
 class AnalysisPaused(Exception):
-    def __init__(self, message, daily_quota=False, retry_after=None):
+    def __init__(self, message, daily_quota=False, retry_after=None, reason=None):
         super().__init__(message)
         self.daily_quota = daily_quota
         self.retry_after = retry_after
+        self.reason = reason
 
 
 def _parse_delay_value(raw):
@@ -315,18 +321,69 @@ def _estimate_tokens(text):
     return math.ceil(len(text.encode("utf-8")) / 2) + 20
 
 
-def _max_input():
-    value = int(current_app.config.get("ANALYSIS_MAX_INPUT_TOKENS", 6000))
+def _work_policy_value(context, name, config_name, default):
+    policy = (context or {}).get("analysis_work_policy") or (context or {}).get("work_policy") or {}
+    return int(policy.get(name, current_app.config.get(config_name, default)))
+
+
+def _max_input(context=None):
+    value = _work_policy_value(context, "max_input_tokens", "ANALYSIS_MAX_INPUT_TOKENS", 6000)
     if value < 1200:
         raise AnalysisError("ANALYSIS_MAX_INPUT_TOKENS must be at least 1200.", 503)
     return value
 
 
-def _max_output():
-    value = int(current_app.config.get("ANALYSIS_MAX_OUTPUT_TOKENS", 1400))
+def _max_output(context=None):
+    value = _work_policy_value(context, "max_output_tokens", "ANALYSIS_MAX_OUTPUT_TOKENS", 4000)
     if value < 200:
         raise AnalysisError("ANALYSIS_MAX_OUTPUT_TOKENS must be at least 200.", 503)
     return value
+
+
+def _max_split_depth(context=None):
+    # The configured value may lower this ceiling, but a work unit must never
+    # recurse beyond the architecture's two additional subdivision levels.
+    return min(MAX_TEXT_SUBDIVISION_DEPTH,
+               max(0, _work_policy_value(context, "max_split_depth", "ANALYSIS_MAX_SPLIT_DEPTH", 2)))
+
+
+def _min_segment_chars(context=None):
+    return max(1, _work_policy_value(context, "min_segment_chars", "ANALYSIS_MIN_SEGMENT_CHARS", 120))
+
+
+def _batch_output_target(context=None):
+    configured = _work_policy_value(
+        context, "batch_target_output_tokens", "ANALYSIS_BATCH_TARGET_OUTPUT_TOKENS", 1600
+    )
+    return max(200, min(configured, _max_output(context)))
+
+
+def _batch_claim_query(analysis, now, max_retries):
+    """Build an atomic due-work claim with limits from the saved run policy."""
+    query = {
+        "analysis_id": analysis["_id"],
+        "status": {"$in": ["pending", "failed", "retrying"]},
+        "terminal_failure": {"$ne": True},
+        "$and": [
+            {"$or": [{"retry_at": {"$exists": False}}, {"retry_at": None},
+                     {"retry_at": {"$lte": now}}]},
+        ],
+    }
+    if analysis.get("provider_policy_version") == 1:
+        provider_count = max(1, len(analysis.get("provider_order") or []))
+        query["$and"].extend([
+            {"$or": [{"provider_window_attempt_count": {"$lt": max_retries * provider_count}},
+                     {"provider_window_attempt_count": {"$exists": False},
+                      "attempt_count": {"$lt": max_retries * provider_count}},
+                     {"provider_window_attempt_count": {"$exists": False},
+                      "attempt_count": {"$exists": False}}]},
+            {"$or": [{"provider_cycle": {"$exists": False}},
+                     {"provider_cycle": {"$lt": max_retries}}]},
+        ])
+    else:
+        query["$and"].append({"$or": [{"attempt_count": {"$exists": False}},
+                                      {"attempt_count": {"$lt": max_retries}}]})
+    return query
 
 
 def _analysis_key(user, tender, file_hash):
@@ -374,6 +431,22 @@ def _next_analysis_version(analyses, base_key):
 def _new_analysis_record(key, extraction, run_origin="standard", request_id=None):
     now = _now()
     version = current_app.config.get("ANALYSIS_VERSION", ANALYSIS_VERSION)
+    provider_models = {
+        "groq": current_app.config.get("GROQ_MODEL", ""),
+        "openrouter": current_app.config.get("OPENROUTER_MODEL", "openai/gpt-oss-120b"),
+        "gemini": current_app.config.get("GEMINI_MODEL", "gemini-3.8-flash"),
+    }
+    provider_order = list(current_app.config.get("ANALYSIS_PROVIDER_ORDER", ["groq", "openrouter", "gemini"]))
+    work_policy = {
+        "version": 1,
+        "max_input_tokens": int(current_app.config.get("ANALYSIS_MAX_INPUT_TOKENS", 6000)),
+        "max_output_tokens": int(current_app.config.get("ANALYSIS_MAX_OUTPUT_TOKENS", 4000)),
+        "max_tpm_tokens": int(current_app.config.get("ANALYSIS_MAX_TPM_TOKENS", 8000)),
+        "batch_target_output_tokens": int(current_app.config.get("ANALYSIS_BATCH_TARGET_OUTPUT_TOKENS", 1600)),
+        "min_segment_chars": int(current_app.config.get("ANALYSIS_MIN_SEGMENT_CHARS", 120)),
+        "max_split_depth": min(MAX_TEXT_SUBDIVISION_DEPTH,
+                               max(0, int(current_app.config.get("ANALYSIS_MAX_SPLIT_DEPTH", 2)))),
+    }
     record = {
         **key, "status": "pending", "plan_ready": False,
         "page_count": extraction.get("page_count", 0), "extracted_pages": extraction.get("extracted_pages", 0),
@@ -387,8 +460,13 @@ def _new_analysis_record(key, extraction, run_origin="standard", request_id=None
         "missing_actual_usage_batches": 0, "unknown_usage_requests": 0, "total_processing_ms": 0,
         "overview_parts": [], "overview_fields": {}, "analysis_version": key["analysis_version"],
         "analysis_logic_version": str(version), "run_origin": run_origin,
-        "provider": "gemini",
-        "model_id": current_app.config.get("GEMINI_MODEL", "gemini-3.8-flash"),
+        "provider_policy_version": 1,
+        "provider_order": provider_order,
+        "provider_models": provider_models,
+        "provider_cooldowns": {},
+        "analysis_work_policy": work_policy,
+        "selected_provider": None, "selected_model": None,
+        "provider": None, "model_id": None,
         "prompt_version": current_app.config.get("ANALYSIS_PROMPT_VERSION", PROMPT_VERSION),
         "prompt_versions_used": [],
         "processing_started_at": now, "processing_finished_at": None,
@@ -400,6 +478,10 @@ def _new_analysis_record(key, extraction, run_origin="standard", request_id=None
 
 
 def _is_gemini_run(analysis):
+    # New policy-versioned runs use the provider dispatcher; retain the legacy
+    # Gemini-only rule for records created before provider policies existed.
+    if analysis.get("provider_policy_version") == 1:
+        return True
     # Provider was added after historical runs had already been persisted.
     provider = analysis.get("provider")
     if provider is None:
@@ -439,118 +521,259 @@ def _score(text):
     return score
 
 
+def _analysis_ref_id(analysis_id, ref):
+    identity = {key: ref.get(key) for key in (
+        "chunk_index", "page_number", "text_start", "text_end", "source_start", "source_end",
+    )}
+    return hashlib.sha256(f"{analysis_id}:{json.dumps(identity, sort_keys=True, separators=(',', ':'))}".encode()).hexdigest()
+
+
+def _natural_boundary(text, start, hard_end, target, min_chars):
+    floor = min(hard_end, start + min(min_chars, max(1, (hard_end - start) // 3)))
+    patterns = (
+        re.compile(r"\n\s*\n"),  # paragraph/section boundary
+        re.compile(r"\n"),         # table row or line boundary
+        re.compile(r"[.!?][\"'’”)]*\s+"),  # sentence boundary
+        re.compile(r"\s+"),        # word boundary for a long sentence
+    )
+    for pattern in patterns:
+        candidates = [match.end() for match in pattern.finditer(text, start, hard_end)
+                      if floor <= match.end() <= hard_end]
+        if candidates:
+            return min(candidates, key=lambda point: (abs(point - target), point > target))
+    return hard_end
+
+
+def _analysis_segments_for_chunk(row, analysis, base_tokens, max_input, output_target):
+    """Create lossless, page-aware analysis ranges from one persisted Phase 2 chunk."""
+    text = row.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        return [], []
+    page = row["page_number"]
+    chunk_index = row["chunk_index"]
+    page_start = row.get("char_start")
+    page_start = int(page_start) if isinstance(page_start, int) and not isinstance(page_start, bool) else None
+    min_chars = _min_segment_chars(analysis)
+    segments, skipped = [], []
+    cursor = 0
+
+    def fits(end):
+        passage = text[cursor:end]
+        input_tokens = _estimate_tokens(f"[SOURCE PAGE {page}]\n{passage}\n[/SOURCE PAGE]")
+        expected_output = _expected_output_tokens(_estimate_tokens(passage), analysis)
+        return base_tokens + input_tokens <= max_input and expected_output <= output_target
+
+    while cursor < len(text):
+        low, high, best = cursor + 1, len(text), cursor
+        while low <= high:
+            middle = (low + high) // 2
+            if fits(middle):
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        if best <= cursor:
+            ref = {
+                "chunk_index": chunk_index, "page_number": page,
+                "text_start": cursor, "text_end": len(text),
+                "source_start": page_start + cursor if page_start is not None else None,
+                "source_end": page_start + len(text) if page_start is not None else None,
+                "source_text_length": len(text), "work_unit_id": None,
+            }
+            ref["work_unit_id"] = _analysis_ref_id(analysis["_id"], ref)
+            skipped.append({"ref": ref, "reason": "Source range cannot fit the configured minimum provider budgets."})
+            break
+        if best < len(text):
+            target = cursor + (best - cursor) * 4 // 5
+            best = _natural_boundary(text, cursor, best, target, min_chars)
+        segment = text[cursor:best]
+        input_tokens = _estimate_tokens(f"[SOURCE PAGE {page}]\n{segment}\n[/SOURCE PAGE]")
+        output_tokens = _expected_output_tokens(_estimate_tokens(segment), analysis)
+        ref = {
+            "chunk_index": chunk_index, "page_number": page,
+            "text_start": cursor, "text_end": best,
+            "source_start": page_start + cursor if page_start is not None else None,
+            "source_end": page_start + best if page_start is not None else None,
+            "source_text_length": len(text),
+        }
+        ref["work_unit_id"] = _analysis_ref_id(analysis["_id"], ref)
+        segments.append({"ref": ref, "input_tokens": input_tokens, "output_tokens": output_tokens})
+        cursor = best
+    return segments, skipped
+
+
 def _plan_batches(analysis, batches, chunks, page_count):
-    """Stream the saved Phase 5 chunks, screen relevance, and persist small chunk-reference batches."""
+    """Persist deterministic, lossless analysis work units over all saved Phase 2 text."""
     analysis_id = analysis["_id"]
     query = {"user_id": analysis["user_id"], "tender_id": analysis["tender_id"], "file_hash": analysis["file_hash"]}
-    batches.delete_many({"analysis_id": analysis_id})
-    candidate_pages, text_pages = set(), set()
-    all_rows = list(chunks.find(query, {"chunk_index": 1, "page_number": 1, "text": 1}).sort("chunk_index", ASCENDING))
-    candidate_rows = []
-    try:
-        ready_chunks = get_database(current_app).tender_llm_ready_chunks
-        candidate_rows = list(ready_chunks.find(
-            query, {"chunk_index": 1, "page_number": 1, "text": 1}
-        ).sort("chunk_index", ASCENDING))
-    except (AttributeError, KeyError, PyMongoError):
-        candidate_rows = []
-    candidate_rows = candidate_rows or all_rows
-    for row in all_rows:
-        page = row.get("page_number")
-        if isinstance(page, int):
-            chunk_text = row.get("text", "")
-            if chunk_text and chunk_text.strip():
-                text_pages.add(page)
-            if any(candidate.get("chunk_index") == row.get("chunk_index") for candidate in candidate_rows):
-                candidate_pages.add(page)
-    selected = set(candidate_pages)
-    for page in candidate_pages:
-        selected.update((page - 1, page + 1))
-    selected.intersection_update(text_pages)
-    if 1 in text_pages:
-        selected.add(1)
-    if page_count in text_pages:
-        selected.add(page_count)
-    if (page_count and page_count <= 12) or (text_pages and len(text_pages) <= 12):
-        selected.update(text_pages)
-
-    rows_by_page = {}
-    for row in candidate_rows:
-        rows_by_page.setdefault(row.get("page_number"), []).append(row)
-    for page in sorted(text_pages):
-        if page not in rows_by_page:
-            rows_by_page[page] = [row for row in all_rows if row.get("page_number") == page]
-        selected.add(page)
-
+    all_rows = list(chunks.find(query, {"chunk_index": 1, "page_number": 1, "text": 1,
+                                        "char_start": 1, "char_end": 1}).sort("chunk_index", ASCENDING))
     base_tokens = _estimate_tokens(SYSTEM_PROMPT + USER_PREFIX)
-    max_input = _max_input()
+    max_input = _max_input(analysis)
     if base_tokens >= max_input:
         raise AnalysisError("The configured input-token budget is too small for the analysis prompt.", 503)
-    refs, text_tokens, expected_output_tokens, batch_index = [], 0, 0, 0
-    max_source_tokens = max_input - base_tokens
-    # Output size must never create a second batch for a single source page. The
-    # provider can process the page as one logical unit; only input size should
-    # determine source batching.
-    max_expected_output = None
+    output_target = _batch_output_target(analysis)
+    all_segments, initial_skips, text_pages = [], [], set()
+    for row in all_rows:
+        if not isinstance(row.get("page_number"), int) or not isinstance(row.get("chunk_index"), int):
+            continue
+        if isinstance(row.get("text"), str) and row["text"].strip():
+            text_pages.add(row["page_number"])
+        segments, skipped = _analysis_segments_for_chunk(row, analysis, base_tokens, max_input, output_target)
+        all_segments.extend(segments)
+        initial_skips.extend(skipped)
 
-    def save_batch():
-        nonlocal refs, text_tokens, expected_output_tokens, batch_index
+    # If planning was interrupted, subtract already-persisted source intervals.
+    # Never delete or replace a saved task; only enqueue uncovered ranges.
+    existing_rows = list(batches.find({"analysis_id": analysis_id}))
+    chunk_lengths = {row["chunk_index"]: len(row.get("text", "")) for row in all_rows}
+    existing_intervals = {}
+    for saved in existing_rows:
+        for ref in saved.get("chunk_refs", []):
+            index = ref.get("chunk_index")
+            if index is None:
+                continue
+            start = max(0, int(ref.get("text_start", 0) or 0))
+            end_value = ref.get("text_end")
+            end = chunk_lengths.get(index, 0) if end_value is None else int(end_value)
+            if end > start:
+                existing_intervals.setdefault(index, []).append((start, end))
+
+    def uncovered(ref):
+        start, end = int(ref["text_start"]), int(ref["text_end"])
+        intervals = sorted(existing_intervals.get(ref["chunk_index"], []))
+        gaps, cursor = [], start
+        for left, right in intervals:
+            if right <= cursor or left >= end:
+                continue
+            if left > cursor:
+                gaps.append((cursor, min(left, end)))
+            cursor = max(cursor, right)
+            if cursor >= end:
+                break
+        if cursor < end:
+            gaps.append((cursor, end))
+        return gaps
+
+    work_items = []
+    source_by_index = {row["chunk_index"]: row for row in all_rows}
+    for item in all_segments:
+        ref = item["ref"]
+        for start, end in uncovered(ref):
+            if (start, end) == (ref["text_start"], ref["text_end"]):
+                work_items.append(item)
+                continue
+            row = source_by_index[ref["chunk_index"]]
+            child_segments, child_skips = _analysis_segments_for_chunk(
+                {**row, "text": row["text"][start:end],
+                 "char_start": (row.get("char_start") or 0) + start},
+                analysis, base_tokens, max_input, output_target,
+            )
+            # Rebase local coordinates and stable IDs after subtracting saved work.
+            for child in child_segments:
+                child_ref = child["ref"]
+                local_start, local_end = child_ref["text_start"], child_ref["text_end"]
+                child_ref["text_start"], child_ref["text_end"] = start + local_start, start + local_end
+                original_start = row.get("char_start")
+                if isinstance(original_start, int):
+                    child_ref["source_start"] = original_start + start + local_start
+                    child_ref["source_end"] = original_start + start + local_end
+                child_ref["source_text_length"] = len(row.get("text", ""))
+                child_ref["work_unit_id"] = _analysis_ref_id(analysis_id, child_ref)
+                work_items.append(child)
+            for skipped in child_skips:
+                skipped_ref = skipped["ref"]
+                skipped_ref["text_start"] += start
+                skipped_ref["text_end"] += start
+                skipped_ref["source_text_length"] = len(row.get("text", ""))
+                skipped_ref["work_unit_id"] = _analysis_ref_id(analysis_id, skipped_ref)
+                initial_skips.append(skipped)
+
+    for item in initial_skips:
+        ref = item["ref"]
+        row = source_by_index[ref["chunk_index"]]
+        for start, end in uncovered(ref):
+            skipped_ref = dict(ref)
+            skipped_ref.update({"text_start": start, "text_end": end})
+            page_start = row.get("char_start")
+            if isinstance(page_start, int):
+                skipped_ref["source_start"] = page_start + start
+                skipped_ref["source_end"] = page_start + end
+            skipped_ref["work_unit_id"] = _analysis_ref_id(analysis_id, skipped_ref)
+            work_items.append({"ref": skipped_ref, "skip_reason": item["reason"]})
+
+    existing_max = max((int(row.get("batch_index", -1)) for row in existing_rows), default=-1)
+    next_index = existing_max + 1
+    docs, refs, input_tokens, output_tokens = [], [], 0, 0
+
+    def flush():
+        nonlocal refs, input_tokens, output_tokens, next_index
         if not refs:
             return
+        stable_refs = json.dumps(refs, sort_keys=True, separators=(",", ":"))
+        batch_id = hashlib.sha256(f"{analysis_id}:initial:{stable_refs}".encode()).hexdigest()
         now = _now()
-        batches.insert_one({
-            "analysis_id": analysis_id, "user_id": analysis["user_id"],
-            "tender_id": analysis["tender_id"], "file_hash": analysis["file_hash"],
-            "batch_index": batch_index, "chunk_refs": refs,
-            "is_overview_batch": batch_index == 0,
+        docs.append({
+            "_id": batch_id, "analysis_id": analysis_id,
+            "user_id": analysis["user_id"], "tender_id": analysis["tender_id"],
+            "file_hash": analysis["file_hash"], "batch_index": next_index,
+            "chunk_refs": list(refs), "is_overview_batch": next_index == 0,
             "prompt_version": current_app.config.get("ANALYSIS_PROMPT_VERSION", PROMPT_VERSION),
-            "estimated_input_tokens": base_tokens + text_tokens,
-            "estimated_output_tokens": expected_output_tokens,
-            "status": "pending", "attempt_count": 0, "api_call_count": 0, "retry_count": 0,
-            "total_tokens": 0, "api_attempts": [],
-            "created_at": now, "updated_at": now,
+            "estimated_input_tokens": base_tokens + input_tokens,
+            "estimated_output_tokens": output_tokens,
+            "analysis_work_policy": analysis.get("analysis_work_policy", {}),
+            "status": "pending", "attempt_count": 0, "provider_window_attempt_count": 0,
+            "api_call_count": 0,
+            "retry_count": 0, "provider_cycle": 0, "total_tokens": 0,
+            "api_attempts": [], "created_at": now, "updated_at": now,
         })
-        refs, text_tokens, expected_output_tokens = [], 0, 0
-        batch_index += 1
+        next_index += 1
+        refs, input_tokens, output_tokens = [], 0, 0
 
-    for page in sorted(selected):
-        page_rows = rows_by_page.get(page, [])
-        if not page_rows:
+    for item in work_items:
+        ref = item["ref"]
+        if item.get("skip_reason"):
+            flush()
+            stable_ref = json.dumps(ref, sort_keys=True, separators=(",", ":"))
+            batch_id = hashlib.sha256(f"{analysis_id}:skipped:{stable_ref}".encode()).hexdigest()
+            docs.append({
+                "_id": batch_id, "analysis_id": analysis_id,
+                "user_id": analysis["user_id"], "tender_id": analysis["tender_id"],
+                "file_hash": analysis["file_hash"], "batch_index": next_index,
+                "chunk_refs": [ref], "analysis_work_policy": analysis.get("analysis_work_policy", {}),
+                "status": "skipped", "skipped_reason": item["skip_reason"],
+                "skipped_text_ranges": [{key: ref.get(key) for key in (
+                    "page_number", "chunk_index", "text_start", "text_end", "source_start", "source_end",
+                )}], "attempt_count": 0, "provider_window_attempt_count": 0,
+                "api_call_count": 0, "retry_count": 0,
+                "api_attempts": [], "created_at": _now(), "updated_at": _now(),
+            })
+            next_index += 1
             continue
-        page_refs = []
-        page_tokens = 0
-        for row in page_rows:
-            page_tokens += _estimate_tokens(f"[SOURCE PAGE {page}]\n{row.get('text', '')}\n[/SOURCE PAGE]")
-            page_refs.append({"chunk_index": row["chunk_index"], "page_number": page})
-        page_output = _expected_output_tokens(page_tokens)
-        if base_tokens + page_tokens > max_input:
-            raise AnalysisError("A saved text passage exceeds the configured input-token budget and was not sent.", 413)
-        if refs and text_tokens + page_tokens > max_source_tokens:
-            save_batch()
-        refs.extend(page_refs)
-        text_tokens += page_tokens
-        expected_output_tokens += page_output
-    save_batch()
-    planned_pages = set()
-    for batch_doc in batches.find({"analysis_id": analysis_id}, {"chunk_refs": 1}):
-        for ref in batch_doc.get("chunk_refs", []):
-            if isinstance(ref.get("page_number"), int):
-                planned_pages.add(ref["page_number"])
-    missing = sorted(text_pages - planned_pages)
-    selected_chunks = sum(len(batch.get("chunk_refs", [])) for batch in batches.find({"analysis_id": analysis_id}, {"chunk_refs": 1}))
+        add_input, add_output = item["input_tokens"], item["output_tokens"]
+        if refs and (base_tokens + input_tokens + add_input > max_input
+                     or output_tokens + add_output > output_target):
+            flush()
+        refs.append(ref)
+        input_tokens += add_input
+        output_tokens += add_output
+    flush()
+
+    for doc in docs:
+        batches.update_one({"_id": doc["_id"]}, {"$setOnInsert": doc}, upsert=True)
+    planned_pages = {ref.get("page_number") for batch_doc in batches.find({"analysis_id": analysis_id})
+                     for ref in batch_doc.get("chunk_refs", []) if isinstance(ref.get("page_number"), int)}
     coverage = {
         "total_pages": page_count, "pages_with_text": len(text_pages),
         "selected_pages": 0, "unexamined_pages": len(text_pages),
-        "unexamined_page_numbers": sorted(text_pages)[:100],
-        "ratio": 0.0,
-        "complete": False,
-        "planned_pages": len(planned_pages),
-        "selection_method": "batch planning",
+        "unexamined_page_numbers": sorted(text_pages)[:100], "ratio": 0.0,
+        "complete": False, "planned_pages": len(planned_pages),
+        "selection_method": "all Phase 2 text, budget-aware paragraph/table/sentence ranges",
         "source_chunks": len(all_rows), "selected_chunks": 0,
+        "text_total_chars": sum(len(row.get("text", "")) for row in all_rows),
     }
     if page_count <= 1 or len(text_pages) <= 1:
-        for batch_doc in batches.find({"analysis_id": analysis_id}, {"_id": 1}):
-            batches.update_one({"_id": batch_doc["_id"]}, {"$set": {"short_tender": True}})
+        batches.update_many({"analysis_id": analysis_id}, {"$set": {"short_tender": True}})
     return batches.count_documents({"analysis_id": analysis_id}), coverage
 
 
@@ -586,7 +809,9 @@ def _record_api_attempt(analysis, batch, analyses, batches, token, attempt, esti
                         provider_total=None, provider_http_status=None,
                         finish_reason=None, error_type=None,
                         retry_after=None, provider_diagnostic=None,
-                        request_diagnostic=None):
+                        request_diagnostic=None, provider=None, model=None,
+                        error_category=None, request_may_have_completed=False,
+                        provider_request_id=None, reasoning_present=False):
     record = {
         "attempt": attempt + 1, "started_at": started_at,
         "elapsed_ms": round((time.perf_counter() - started_perf) * 1000, 1),
@@ -601,10 +826,227 @@ def _record_api_attempt(analysis, batch, analyses, batches, token, attempt, esti
         "retry_after_seconds": retry_after,
         "provider_diagnostic": provider_diagnostic,
         "request_diagnostic": request_diagnostic,
+        "provider": provider, "model": model, "error_category": error_category,
+        "request_may_have_completed": bool(request_may_have_completed),
+        "provider_request_id": provider_request_id,
+        "reasoning_present": bool(reasoning_present),
     }
     analyses.update_one({"_id": analysis["_id"], "processing_token": token},
                         {"$push": {"api_attempts": record}})
     batches.update_one({"_id": batch["_id"]}, {"$push": {"api_attempts": record}})
+
+
+def _provider_request(messages, analysis, batch, analyses, batches, token):
+    """One ordered failover cycle; response parsing remains in _process_batch."""
+    order = list(analysis.get("provider_order") or [])
+    models = analysis.get("provider_models") or {}
+    preferred = batch.get("preferred_provider") or batch.get("provider")
+    if preferred in order:
+        order = [preferred] + [name for name in order if name != preferred]
+    max_cycles = max(1, min(5, int(current_app.config.get("ANALYSIS_RETRY_ATTEMPTS", 3))))
+    provider_cycle = max(0, int(batch.get("provider_cycle", 0)))
+    attempt = max(0, int(batch.get("provider_window_attempt_count", batch.get("attempt_count", 0))))
+    total_attempt_budget = max_cycles * max(1, len(order))
+    order = order[:max(0, total_attempt_budget - attempt)]
+    if provider_cycle >= max_cycles or not order:
+        raise AnalysisError("The bounded provider retry policy is exhausted for this batch.", 502,
+                            error_category="provider_error")
+    settings = {
+        "timeout_seconds": float(current_app.config.get("ANALYSIS_PROVIDER_TIMEOUT_SECONDS", 30)),
+        "connect_timeout_seconds": float(current_app.config.get("ANALYSIS_PROVIDER_CONNECT_TIMEOUT_SECONDS", 10)),
+        "max_output_tokens": _tpm_output_budget(
+            _estimate_tokens("".join(item.get("content", "") for item in messages)),
+            _request_output_budget(batch, batch.get("_request_output_tokens")),
+            batch,
+        ),
+    }
+    providers = {
+        "groq": (current_app.config.get("GROQ_API_KEY", ""), models.get("groq"), request_groq),
+        "openrouter": (current_app.config.get("OPENROUTER_API_KEY", ""), models.get("openrouter"), request_openrouter),
+        "gemini": (current_app.config.get("GEMINI_API_KEY", ""), models.get("gemini"), request_gemini),
+    }
+    failures = []
+    cooldown = None
+    attempts_this_cycle = 0
+    for provider in order:
+        if provider not in providers:
+            continue
+        prior_cooldown = (analysis.get("provider_cooldowns") or {}).get(provider, {})
+        prior_until = _as_utc(prior_cooldown.get("retry_at"))
+        if prior_until and prior_until > _now():
+            wait = max(0.0, (prior_until - _now()).total_seconds())
+            cooldown = max(cooldown or 0.0, wait)
+            failures.append(f"{provider}: cooling down")
+            continue
+        api_key, model, adapter = providers[provider]
+        if not api_key or not model:
+            failures.append(f"{provider}: not configured")
+            continue
+        started_at, started_perf = _now(), time.perf_counter()
+        estimated = _estimate_tokens("".join(item.get("content", "") for item in messages))
+        analyses.update_one({"_id": analysis["_id"], "processing_token": token}, {
+            "$inc": {"request_count": 1, "api_call_count": 1, "estimated_input_tokens": estimated,
+                     "retry_count": 1 if attempt else 0},
+            "$set": {"updated_at": started_at},
+            "$addToSet": {"prompt_versions_used": batch.get("prompt_version")},
+        })
+        batches.update_one({"_id": batch["_id"]}, {"$inc": {
+            "attempt_count": 1, "provider_window_attempt_count": 1,
+            "api_call_count": 1, "retry_count": 1 if attempt else 0,
+        }, "$set": {"last_attempt_at": started_at, "last_activity_at": started_at, "updated_at": started_at}})
+        attempts_this_cycle += 1
+        try:
+            kwargs = {**settings, "model": model, "api_key": api_key}
+            if provider == "openrouter":
+                kwargs.update({"base_url": current_app.config.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                               "site_url": current_app.config.get("OPENROUTER_SITE_URL") or None,
+                               "app_name": current_app.config.get("OPENROUTER_APP_NAME", "TenderForge")})
+            if provider == "gemini":
+                kwargs.pop("connect_timeout_seconds", None)
+                kwargs["response_schema"] = _GEMINI_RESPONSE_SCHEMA
+            response = adapter(messages, **kwargs)
+            truncated = str(response.finish_reason or "").casefold() in {
+                "length", "max_tokens", "max_completion_tokens",
+            }
+            if (not isinstance(response.content, str) or not response.content.strip()) and not truncated:
+                raise ProviderRequestError(provider, "empty_content", "Provider returned no usable content", response.http_status)
+            normalized_result = SimpleNamespace(
+                text=response.content if isinstance(response.content, str) else "",
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=response.input_tokens,
+                    candidates_token_count=response.output_tokens,
+                    total_token_count=response.total_tokens,
+                ),
+                candidates=[SimpleNamespace(finish_reason=response.finish_reason)],
+            )
+            _record_api_attempt(
+                analysis, batch, analyses, batches, token, attempt, estimated, started_at, started_perf,
+                response.input_tokens, response.output_tokens, provider_total=response.total_tokens,
+                provider_http_status=response.http_status or 200, finish_reason=response.finish_reason,
+                request_diagnostic={"provider": provider, "model": model, "estimated_input_tokens": estimated},
+                provider=provider, model=model, provider_request_id=response.request_id,
+                reasoning_present=getattr(response, "reasoning_present", False),
+            )
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "provider": provider, "model_id": model, "preferred_provider": provider,
+                "last_activity_at": _now(), "updated_at": _now(),
+            }, "$unset": {"uncertain_timeout_pending": "", "uncertain_timeout_retries": ""}})
+            selected_provider = analysis.get("selected_provider") or provider
+            selected_model = analysis.get("selected_model") or model
+            analyses.update_one({"_id": analysis["_id"], "processing_token": token}, {"$set": {
+                "selected_provider": selected_provider, "selected_model": selected_model,
+                "provider": selected_provider, "model_id": selected_model,
+                "updated_at": _now(),
+            }})
+            analysis["selected_provider"], analysis["selected_model"] = selected_provider, selected_model
+            attempt += 1
+            return (normalized_result, estimated, response.input_tokens, response.output_tokens,
+                    None, response.total_tokens, response.latency_ms)
+        except ProviderRequestError as error:
+            diagnostic = {"provider": provider, "model": model, "status_code": error.status_code,
+                          "provider_code": error.provider_code, "provider_message": str(error),
+                          "error_category": error.category,
+                          "request_may_have_completed": error.request_may_have_completed,
+                          "retry_after_seconds": error.retry_after_seconds,
+                          "finish_reason": error.finish_reason,
+                          "provider_input_tokens": error.input_tokens,
+                          "provider_output_tokens": error.output_tokens,
+                          "provider_total_tokens": error.total_tokens,
+                          "reasoning_present": error.reasoning_present,
+                          "timestamp": _now()}
+            _record_api_attempt(
+                analysis, batch, analyses, batches, token, attempt, estimated, started_at, started_perf,
+                error_type=error.category, retry_after=error.retry_after_seconds,
+                provider_input=error.input_tokens, provider_output=error.output_tokens,
+                provider_total=error.total_tokens, finish_reason=error.finish_reason,
+                provider_http_status=error.status_code, provider_diagnostic=diagnostic,
+                request_diagnostic={"provider": provider, "model": model, "estimated_input_tokens": estimated},
+                provider=provider, model=model, error_category=error.category,
+                request_may_have_completed=error.request_may_have_completed,
+                provider_request_id=error.request_id, reasoning_present=error.reasoning_present,
+            )
+            failures.append(f"{provider}: {error.category} (HTTP {error.status_code or 'unknown'})")
+            if error.category == "authentication" or error.status_code in (401, 403):
+                batches.update_one({"_id": batch["_id"]}, {"$set": {"terminal_failure": True}})
+                raise AnalysisError(f"{provider} authentication or permission failed; provider failover stopped.", 502,
+                                    error_category="provider_error") from error
+            if error.category == "provider_client_error":
+                batches.update_one({"_id": batch["_id"]}, {"$set": {"terminal_failure": True}})
+                raise AnalysisError(f"{provider} client configuration failed; provider failover stopped.", 503,
+                                    error_category="provider_error") from error
+            if error.category in {"timeout_uncertain", "transport_uncertain"}:
+                prior = int(batch.get("uncertain_timeout_retries", 0))
+                batches.update_one({"_id": batch["_id"]}, {"$set": {
+                    "preferred_provider": provider, "uncertain_timeout_pending": True,
+                    "uncertain_timeout_retries": prior + 1,
+                }})
+                if prior == 0:
+                    raise AnalysisPaused(
+                        f"{provider} timed out after transmission; retry this provider after cooldown.",
+                        False, error.retry_after_seconds or float(current_app.config.get("ANALYSIS_RETRY_BASE_SECONDS", 2)),
+                        reason="uncertain_timeout",
+                    ) from error
+                # One same-provider retry has now occurred; a later uncertain
+                # timeout may fail over to avoid blocking the whole batch forever.
+            unusable_response = error.category in {"empty_content", "reasoning_only_response"}
+            if (error.status_code is not None and not (error.status_code == 429 or error.status_code >= 500)
+                    and not unusable_response):
+                batches.update_one({"_id": batch["_id"]}, {"$set": {"terminal_failure": True}})
+                raise AnalysisError(f"{provider} rejected the analysis request (HTTP {error.status_code}).", 400,
+                                    error_category="provider_error") from error
+            if error.status_code == 429 or (error.status_code is not None and error.status_code >= 500):
+                fallback = (current_app.config.get("ANALYSIS_RATE_LIMIT_FALLBACK_SECONDS", 60)
+                            if error.status_code == 429 else current_app.config.get("ANALYSIS_RETRY_BASE_SECONDS", 2))
+                provider_wait = error.retry_after_seconds if error.retry_after_seconds is not None else float(fallback)
+                provider_retry_at = _now() + timedelta(seconds=max(0.0, provider_wait))
+                cooldown = max(cooldown or 0, max(0.0, provider_wait))
+                analysis.setdefault("provider_cooldowns", {})[provider] = {
+                    "retry_at": provider_retry_at, "reason": error.category,
+                    "http_status": error.status_code,
+                }
+                analyses.update_one({"_id": analysis["_id"], "processing_token": token}, {"$set": {
+                    f"provider_cooldowns.{provider}": analysis["provider_cooldowns"][provider],
+                    "updated_at": _now(),
+                }})
+            attempt += 1
+            # Retry-After is recorded for cooldowns after this immediate failover cycle.
+    if cooldown is not None:
+        next_cycle = provider_cycle + (1 if attempts_this_cycle else 0)
+        if attempts_this_cycle:
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "provider_cycle": next_cycle,
+                "retry_at": _now() + timedelta(seconds=cooldown),
+                "last_provider_failure": "; ".join(failures),
+            }})
+        if next_cycle >= max_cycles or attempt >= total_attempt_budget:
+            # A bounded recovery window ends here. Keep cumulative attempt
+            # history, then let a later explicit Resume retry after cooldown.
+            # This prevents a temporary provider outage from permanently
+            # stranding otherwise valid source work.
+            window_count = int(batch.get("outage_retry_count", 0)) + 1
+            retry_base = float(current_app.config.get("ANALYSIS_RETRY_BASE_SECONDS", 2))
+            max_wait = max(0.0, float(current_app.config.get("ANALYSIS_PROVIDER_MAX_COOLDOWN_SECONDS", 300)))
+            backoff = min(max_wait, retry_base * (2 ** min(window_count, 10)))
+            cooldown = max(cooldown or 0.0, backoff)
+            retry_at = _now() + timedelta(seconds=cooldown)
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "provider_cycle": 0, "provider_window_attempt_count": 0,
+                "status": "retrying", "outage_retry_count": window_count,
+                "retry_at": retry_at,
+                "last_provider_failure": "; ".join(failures),
+                "error_message": "All providers failed in the bounded retry window; Resume may retry after cooldown.",
+            }})
+            raise AnalysisPaused(
+                "All configured AI providers failed during this bounded retry window; resume after cooldown.",
+                False, cooldown, reason="provider_cooldown",
+            )
+        raise AnalysisPaused(
+            "All eligible AI providers failed; analysis is paused for the provider cooldown.",
+            False, cooldown, reason="provider_cooldown",
+        )
+    batches.update_one({"_id": batch["_id"]}, {"$set": {"terminal_failure": True}})
+    raise AnalysisError("All configured AI providers failed for this batch: " + "; ".join(failures),
+                        502, error_category="provider_error")
 
 
 def _provider_diagnostic(error, model, estimated, output_budget):
@@ -663,24 +1105,27 @@ def _request_error_message(status_code, diagnostic):
     return f"Gemini request failed (HTTP {status_code or 'unknown'}): {diagnostic.get('provider_message') or 'provider rejected the request.'}"
 
 
-def _request_output_budget(batch):
+def _request_output_budget(batch, estimated_output_tokens=None):
     expected = max(0, int(batch.get("estimated_output_tokens", 0)))
-    configured = _max_output()
-    if batch.get("short_tender"):
-        short_budget = int(current_app.config.get("ANALYSIS_SHORT_TENDER_OUTPUT_TOKENS", 4000))
+    if estimated_output_tokens is not None:
+        expected = max(0, int(estimated_output_tokens))
+    configured = _max_output(batch)
+    if batch.get("short_tender") and not int(batch.get("subdivision_depth", 0)):
+        short_budget = int(current_app.config.get("ANALYSIS_SHORT_TENDER_OUTPUT_TOKENS", configured))
         return max(configured, min(4000, max(2400, short_budget)))
-    return min(configured, max(2400, min(4000, expected + 600)))
+    # Small split segments should not keep inheriting the parent batch's large
+    # output budget. The output headroom scales with the segment's estimate.
+    floor = 400 if int(batch.get("subdivision_depth", 0)) else 2400
+    return min(configured, max(floor, min(4000, expected + 600)))
 
 
-def _tpm_output_budget(estimated_input, requested_output):
-    tpm_limit = int(current_app.config.get("ANALYSIS_MAX_TPM_TOKENS", 8000))
+def _tpm_output_budget(estimated_input, requested_output, context=None):
+    tpm_limit = _work_policy_value(context, "max_tpm_tokens", "ANALYSIS_MAX_TPM_TOKENS", 8000)
     if tpm_limit < 1:
         raise AnalysisError("ANALYSIS_MAX_TPM_TOKENS must be positive.", 503)
     remaining = tpm_limit - estimated_input
     if remaining < 200:
-        raise AnalysisError(
-            "This batch leaves insufficient token budget for a valid Gemini response; reduce the batch size before retrying.", 413,
-        )
+        raise AnalysisError("This batch leaves insufficient output budget; reduce the source segment before retrying.", 413)
     return min(requested_output, remaining)
 
 
@@ -709,7 +1154,7 @@ def _gemini_request(messages, analysis, batch, analyses, batches, token):
     system_instruction = next((item["content"] for item in messages if item.get("role") == "system"), "")
     contents = "\n\n".join(item.get("content", "") for item in messages if item.get("role") != "system")
     estimated = _estimate_tokens(system_instruction + contents)
-    if estimated > _max_input():
+    if estimated > _max_input(analysis):
         raise AnalysisError("This batch exceeds the configured input-token budget and was not sent.", 413)
 
     client = genai.Client(api_key=api_key, http_options={
@@ -737,7 +1182,9 @@ def _gemini_request(messages, analysis, batch, analyses, batches, token):
         batches.update_one({"_id": batch["_id"]}, {"$inc": {
             "attempt_count": 1, "api_call_count": 1, "retry_count": 1 if attempt_ordinal else 0,
         }, "$set": {"last_attempt_at": now, "last_activity_at": now, "updated_at": now}})
-        output_budget = _tpm_output_budget(estimated, _request_output_budget(batch))
+        output_budget = _tpm_output_budget(
+            estimated, _request_output_budget(batch, batch.get("_request_output_tokens")), batch
+        )
         request_diagnostic = {
             "endpoint": _GEMINI_ENDPOINT, "model": model, "max_output_tokens": output_budget,
             "temperature": 0, "thinking_level": "LOW", "response_mime_type": "application/json",
@@ -1123,9 +1570,9 @@ def _anchors_compatible(left, right):
     return not left or not right or left.issubset(right) or right.issubset(left)
 
 
-def _expected_output_tokens(source_tokens):
+def _expected_output_tokens(source_tokens, context=None):
     """Reserve output headroom based on the amount of source sent to the model."""
-    return max(400, min(_max_output() - 200, math.ceil(source_tokens * 0.75)))
+    return max(400, min(_max_output(context) - 200, math.ceil(source_tokens * 0.75)))
 
 
 def _requirement_status(raw, text):
@@ -1293,8 +1740,29 @@ def _validate_requirement(raw, batch_pages, analysis, batch, evidence_matches, i
     if title == "Requirement requiring review" or not description_key:
         identity += f"|{batch['batch_index']}|{item_index}|{hashlib.sha256(evidence.encode()).hexdigest()}"
     req_id = hashlib.sha256(f"{analysis['_id']}:{identity}".encode()).hexdigest()
+    source_offset = None
+    if page_valid and evidence and source_texts:
+        page_text = source_texts.get(source_page, "")
+        match_start = page_text.find(evidence)
+        if match_start >= 0:
+            # Phase 2 chunk offsets map this page-local quote back to the saved
+            # extracted source. Older chunks without offsets remain readable.
+            refs = [ref for ref in batch.get("chunk_refs", []) if ref.get("page_number") == source_page]
+            for ref in refs:
+                source_start = ref.get("source_start")
+                source_end = ref.get("source_end")
+                if (source_start is not None and source_end is not None
+                        and int(source_start) <= match_start
+                        and match_start + len(evidence) <= int(source_end)):
+                    source_offset = {
+                        "source_start": match_start,
+                        "source_end": match_start + len(evidence),
+                    }
+                    break
     source = {"source_page": source_page, "evidence_text": evidence,
-              "batch_index": batch["batch_index"], "verified": bool(page_valid and value_valid)}
+              "verified": bool(page_valid and value_valid)}
+    if source_offset:
+        source.update(source_offset)
     verified = not reasons
     now = _now()
     return {
@@ -1463,7 +1931,7 @@ def _values_conflict(left_value, right_value, left_status="unclear", right_statu
     return bool(negation.search(left_value)) != bool(negation.search(right_value))
 
 
-def _save_requirements(raw_items, analysis, batch, pages, requirements, preliminary=False):
+def _save_requirements(raw_items, analysis, batch, pages, requirements, preliminary=False, verified_only=False):
     batch_pages = {ref["page_number"] for ref in batch.get("chunk_refs", [])}
     evidence_by_page = {}
     for raw in raw_items:
@@ -1484,6 +1952,8 @@ def _save_requirements(raw_items, analysis, batch, pages, requirements, prelimin
     grouped = {}
     for index, raw in enumerate(raw_items):
         item = _validate_requirement(raw, batch_pages, analysis, batch, evidence_matches, index, source_texts)
+        if verified_only and item["validation_status"] != "verified":
+            continue
         item["preliminary"] = preliminary
         if item["_id"] not in grouped:
             grouped[item["_id"]] = item
@@ -1531,6 +2001,25 @@ def _save_requirements(raw_items, analysis, batch, pages, requirements, prelimin
                     _requirements_match(old_item, item)):
                 item["_id"] = row["_id"]
                 break
+
+    existing_by_id = {row.get("_id"): row for row in existing_rows}
+    for item in incoming:
+        row = existing_by_id.get(item["_id"])
+        if not row:
+            continue
+        old_sources = row.get("source_evidence") or []
+        old_keys = {
+            (source.get("source_page"), _normalize(source.get("evidence_text", "")))
+            for source in old_sources if isinstance(source, dict)
+        }
+        unique, seen = [], set(old_keys)
+        for source in item.get("source_evidence", []):
+            key = (source.get("source_page"), _normalize(source.get("evidence_text", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(source)
+        item["source_evidence"] = unique
 
     title_groups = {}
     for item in incoming:
@@ -1656,7 +2145,8 @@ def _extract_partial_response(content):
     return overview, requirements
 
 
-def _recover_stale_batches(analysis_id, batches, lease_seconds=300, max_retries=3):
+def _recover_stale_batches(analysis_id, batches, lease_seconds=300, max_retries=3, provider_policy_version=0,
+                          provider_count=1):
     """Detect batches left in 'processing' whose lease/activity timed out, recovering or failing them."""
     now = _now()
     timeout = timedelta(seconds=max(30, lease_seconds))
@@ -1667,12 +2157,14 @@ def _recover_stale_batches(analysis_id, batches, lease_seconds=300, max_retries=
             activity_utc = _as_utc(activity)
             if activity_utc and (now - activity_utc) < timeout:
                 continue
-        attempts = batch.get("attempt_count", 0)
-        if attempts >= max_retries:
+        attempts = batch.get("provider_cycle", 0) if provider_policy_version == 1 else batch.get("attempt_count", 0)
+        total_attempts = int(batch.get("provider_window_attempt_count", batch.get("attempt_count", 0)))
+        max_total_attempts = max_retries * max(1, provider_count)
+        if attempts >= max_retries or (provider_policy_version == 1 and total_attempts >= max_total_attempts):
             batches.update_one({"_id": batch["_id"]}, {"$set": {
                 "status": "failed",
                 "completed_at": None,
-                "error_message": f"Batch processing stalled and exceeded maximum retry attempts ({attempts}/{max_retries}).",
+                "error_message": f"Batch processing stalled and exceeded maximum retry attempts under its bounded retry policy ({attempts}/{max_retries} cycles).",
                 "last_activity_at": now,
                 "updated_at": now,
             }})
@@ -1690,82 +2182,214 @@ def _recover_stale_batches(analysis_id, batches, lease_seconds=300, max_retries=
                          batch.get("_id"), batch.get("batch_index"), attempts, max_retries)
 
 
-def _calculate_actual_coverage(analysis, batches, chunks=None):
+def _calculate_actual_coverage(analysis, batches, chunks=None, pages=None):
     aid = analysis["_id"]
     query = {"user_id": analysis["user_id"], "tender_id": analysis["tender_id"], "file_hash": analysis["file_hash"]}
-    text_pages = set()
-    source_count = 0
-    if chunks is not None:
-        for row in chunks.find(query, {"page_number": 1, "text": 1}):
-            source_count += 1
-            page = row.get("page_number")
-            if isinstance(page, int) and str(row.get("text", "")).strip():
-                text_pages.add(page)
+    source_rows = list(chunks.find(query, {"chunk_index": 1, "page_number": 1, "text": 1,
+                                           "char_start": 1, "char_end": 1})) if chunks is not None else []
+    source_by_index = {row["chunk_index"]: row for row in source_rows if row.get("chunk_index") is not None}
+    text_pages = {row.get("page_number") for row in source_rows
+                  if isinstance(row.get("page_number"), int) and str(row.get("text", "")).strip()}
+    source_count = sum(bool(str(row.get("text", "")).strip()) for row in source_rows)
     if not text_pages:
-        all_batches = list(batches.find({"analysis_id": aid}, {"chunk_refs": 1}))
-        for b in all_batches:
-            for ref in b.get("chunk_refs", []):
-                p = ref.get("page_number")
-                if isinstance(p, int):
-                    text_pages.add(p)
-        source_count = len(text_pages)
-
+        for b in batches.find({"analysis_id": aid}, {"chunk_refs": 1}):
+            text_pages.update(ref.get("page_number") for ref in b.get("chunk_refs", [])
+                              if isinstance(ref.get("page_number"), int))
     page_count = analysis.get("page_count", len(text_pages))
-    completed_batches = list(batches.find({"analysis_id": aid, "status": "completed"}, {"chunk_refs": 1}))
-    completed_pages = set()
-    completed_chunks = 0
-    for b in completed_batches:
-        refs = b.get("chunk_refs", [])
-        completed_chunks += len(refs)
-        for ref in refs:
-            p = ref.get("page_number")
-            if isinstance(p, int):
-                completed_pages.add(p)
+
+    def merged_ranges(values):
+        merged = []
+        for start, end in sorted(values):
+            if end <= start:
+                continue
+            if not merged or start > merged[-1][1]:
+                merged.append([start, end])
+            else:
+                merged[-1][1] = max(merged[-1][1], end)
+        return merged
+
+    def range_length(values):
+        return sum(end - start for start, end in merged_ranges(values))
+
+    page_texts = {}
+    if pages is not None:
+        for page in text_pages:
+            page_text = _saved_page_text(pages, analysis["user_id"], analysis["tender_id"],
+                                         analysis["file_hash"], page)
+            if page_text:
+                page_texts[page] = page_text
+    has_page_offsets = bool(page_texts) and set(page_texts) == text_pages and all(
+        isinstance(row.get("char_start"), int) for row in source_rows if str(row.get("text", "")).strip()
+    )
+
+    if has_page_offsets:
+        total_chars = sum(len(value) for value in page_texts.values())
+        completed_ranges, skipped_ranges = {}, {}
+        for batch in batches.find({"analysis_id": aid}, {"status": 1, "chunk_refs": 1}):
+            status = batch.get("status")
+            if status not in {"completed", "skipped"}:
+                continue
+            target = completed_ranges if status == "completed" else skipped_ranges
+            for ref in batch.get("chunk_refs", []):
+                page, index = ref.get("page_number"), ref.get("chunk_index")
+                source = source_by_index.get(index, {})
+                page_start = ref.get("source_start")
+                if page_start is None and isinstance(source.get("char_start"), int):
+                    page_start = source["char_start"] + int(ref.get("text_start", 0) or 0)
+                page_end = ref.get("source_end")
+                if page_end is None and page_start is not None:
+                    local_end = ref.get("text_end")
+                    local_start = int(ref.get("text_start", 0) or 0)
+                    local_end = len(source.get("text", "")) if local_end is None else int(local_end)
+                    page_end = page_start + max(0, local_end - local_start)
+                if page in page_texts and page_start is not None and page_end is not None:
+                    target.setdefault(page, []).append((max(0, int(page_start)), min(len(page_texts[page]), int(page_end))))
+        completed_chars = sum(range_length(values) for values in completed_ranges.values())
+        skipped_chars = sum(range_length(values) for values in skipped_ranges.values())
+        completed_pages = {page for page, text in page_texts.items()
+                           if range_length(completed_ranges.get(page, [])) >= len(text)
+                           and not range_length(skipped_ranges.get(page, []))}
+        skipped_chunks = len(skipped_ranges)
+        selected_chunks = len({ref.get("work_unit_id", (ref.get("chunk_index"), ref.get("text_start", 0), ref.get("text_end")))
+                               for batch in batches.find({"analysis_id": aid, "status": "completed"}, {"chunk_refs": 1})
+                               for ref in batch.get("chunk_refs", [])})
+    else:
+        source_lengths = {index: len(row.get("text", "")) for index, row in source_by_index.items()}
+        completed_ranges, skipped_ranges = {}, {}
+        for batch in batches.find({"analysis_id": aid}, {"status": 1, "chunk_refs": 1}):
+            status = batch.get("status")
+            if status not in {"completed", "skipped"}:
+                continue
+            target = completed_ranges if status == "completed" else skipped_ranges
+            for ref in batch.get("chunk_refs", []):
+                index = ref.get("chunk_index")
+                if index is None:
+                    continue
+                start = max(0, int(ref.get("text_start", 0) or 0))
+                end = ref.get("text_end")
+                end = source_lengths.get(index, 0) if end is None else min(source_lengths.get(index, int(end)), int(end))
+                if end > start:
+                    target.setdefault(index, []).append((start, end))
+        total_chars = sum(source_lengths.values())
+        completed_chars = sum(range_length(values) for values in completed_ranges.values())
+        skipped_chars = sum(range_length(values) for values in skipped_ranges.values())
+        completed_pages = set()
+        page_indexes = {}
+        for index, row in source_by_index.items():
+            if row.get("page_number") in text_pages:
+                page_indexes.setdefault(row["page_number"], []).append(index)
+        for page, indexes in page_indexes.items():
+            if all(range_length(completed_ranges.get(index, [])) >= source_lengths.get(index, 0)
+                   for index in indexes):
+                completed_pages.add(page)
+        skipped_chunks = len(skipped_ranges)
+        selected_chunks = len(completed_ranges)
 
     missing = sorted(text_pages - completed_pages)
-    ratio = round(min(1.0, len(completed_pages) / max(len(text_pages), 1)), 3)
-    is_complete = len(missing) == 0 and len(text_pages) > 0
-
+    ratio = round(len(completed_pages) / max(len(text_pages), 1), 3)
+    text_ratio = round(min(1.0, completed_chars / max(total_chars, 1)), 4)
+    is_complete = bool(text_pages) and not missing and skipped_chars == 0 and total_chars > 0
     return {
-        "total_pages": page_count,
-        "pages_with_text": len(text_pages),
-        "selected_pages": len(completed_pages),
-        "unexamined_pages": len(missing),
-        "unexamined_page_numbers": missing[:100],
-        "ratio": ratio,
-        "complete": is_complete,
-        "selection_method": "complete coverage" if is_complete else "partial batch processing",
-        "source_chunks": source_count,
-        "selected_chunks": completed_chunks,
+        "total_pages": page_count, "pages_with_text": len(text_pages),
+        "pages_without_text": max(0, page_count - len(text_pages)),
+        "selected_pages": len(completed_pages), "unexamined_pages": len(missing),
+        "unexamined_page_numbers": missing[:100], "ratio": ratio, "complete": is_complete,
+        "selection_method": "all extracted text ranges",
+        "source_chunks": source_count, "selected_chunks": selected_chunks,
+        "text_total_chars": total_chars, "text_covered_chars": completed_chars,
+        "text_skipped_chars": skipped_chars,
+        "unexamined_text_chars": max(0, total_chars - completed_chars - skipped_chars),
+        "text_coverage_ratio": text_ratio, "skipped_chunks": skipped_chunks,
     }
 
 
-def _split_truncated_batch(batch, batches):
-    """Create stable, independently resumable child tasks for a truncated batch."""
+def _split_truncated_batch(batch, batches, chunks=None):
+    """Persist deterministic child tasks, subdividing source ranges at most twice."""
     batch_id = batch["_id"]
     plan = batch.get("split_plan")
     if not plan:
         refs = batch.get("chunk_refs", [])
+        if not refs:
+            batches.update_one({"_id": batch_id}, {"$set": {
+                "status": "skipped", "completed_at": _now(),
+                "skipped_reason": "No saved source references were available for subdivision.",
+                "skipped_text_ranges": [], "error_message": "No saved source references; batch skipped.",
+                "updated_at": _now(),
+            }})
+            return 0
         by_page = {}
         for ref in refs:
             by_page.setdefault(ref["page_number"], []).append(ref)
         groups = [by_page[page] for page in sorted(by_page)]
-        if len(groups) <= 1 and groups and len(groups[0]) > 1:
-            groups = [[ref] for ref in groups[0]]
-        if len(groups) <= 1:
-            failure_category = batch.get("failure_category")
-            manual_review_reason = (
-                "incomplete_json_single_reference" if failure_category == "incomplete_json"
-                else "output_truncated_single_reference"
-            )
+        depth = int(batch.get("subdivision_depth", 0))
+        max_depth = _max_split_depth(batch)
+        if depth >= max_depth:
             batches.update_one({"_id": batch_id}, {"$set": {
-                "status": "manual_review", "split_plan": [], "completed_at": None,
-                "manual_review_reason": manual_review_reason,
+                "status": "skipped", "split_plan": [], "completed_at": _now(),
+                "skipped_reason": "Output remained truncated at the smallest permitted source segment.",
+                "skipped_text_ranges": [{
+                    "page_number": ref.get("page_number"), "chunk_index": ref.get("chunk_index"),
+                    "text_start": int(ref.get("text_start", 0)), "text_end": ref.get("text_end"),
+                    "source_start": ref.get("source_start"), "source_end": ref.get("source_end"),
+                } for ref in refs],
                 "last_activity_at": _now(),
-                "error_message": "This source passage still exceeded the output limit when isolated. Review this page manually.",
+                "error_message": "Output remained truncated at the smallest permitted source segment; passage skipped.",
                 "updated_at": _now(),
             }})
             return 0
+        if len(groups) <= 1 and groups and len(groups[0]) > 1:
+            groups = [[ref] for ref in groups[0]]
+        if len(groups) <= 1 and groups:
+            group = groups[0]
+            if len(group) == 1 and depth < max_depth:
+                ref = group[0]
+                chunk_query = {"chunk_index": ref["chunk_index"]}
+                for key in ("user_id", "tender_id", "file_hash"):
+                    if batch.get(key) is not None:
+                        chunk_query[key] = batch[key]
+                chunk = chunks.find_one(chunk_query) if chunks is not None else None
+                text = (chunk or {}).get("text", "")
+                start = int(ref.get("text_start", 0))
+                end = int(ref.get("text_end", len(text)))
+                if end > len(text):
+                    end = len(text)
+                min_chars = _min_segment_chars(batch)
+                if end - start >= min_chars * 2:
+                    boundary = _natural_boundary(text, start, end, start + (end - start) // 2, min_chars)
+                    if boundary <= start or boundary >= end:
+                        boundary = start + (end - start) // 2
+                    if boundary - start >= min_chars and end - boundary >= min_chars:
+                        page_start = ref.get("source_start")
+                        if page_start is None:
+                            base = (chunk or {}).get("char_start")
+                            page_start = int(base) + start if isinstance(base, int) else None
+                        left, right = dict(ref), dict(ref)
+                        left.update({"text_start": start, "text_end": boundary,
+                                     "source_start": page_start,
+                                     "source_end": page_start + boundary - start if page_start is not None else None})
+                        right.update({"text_start": boundary, "text_end": end,
+                                      "source_start": page_start + boundary - start if page_start is not None else None,
+                                      "source_end": page_start + end - start if page_start is not None else None})
+                        left["work_unit_id"] = _analysis_ref_id(batch["analysis_id"], left)
+                        right["work_unit_id"] = _analysis_ref_id(batch["analysis_id"], right)
+                        groups = [[left], [right]]
+            if len(groups) <= 1:
+                skipped_ranges = [{
+                    "page_number": ref.get("page_number"),
+                    "chunk_index": ref.get("chunk_index"),
+                    "text_start": int(ref.get("text_start", 0)),
+                    "text_end": ref.get("text_end"),
+                    "source_start": ref.get("source_start"), "source_end": ref.get("source_end"),
+                } for ref in refs]
+                batches.update_one({"_id": batch_id}, {"$set": {
+                    "status": "skipped", "split_plan": [], "completed_at": _now(),
+                    "skipped_reason": "Output remained truncated at the smallest permitted source segment.",
+                    "skipped_text_ranges": skipped_ranges,
+                    "last_activity_at": _now(),
+                    "error_message": "Output remained truncated at the smallest permitted source segment; passage skipped.",
+                    "updated_at": _now(),
+                }})
+                return 0
         siblings = list(batches.find({"analysis_id": batch["analysis_id"]}, {"batch_index": 1}))
         next_index = max((row.get("batch_index", -1) for row in siblings), default=-1) + 1
         plan = []
@@ -1781,10 +2405,14 @@ def _split_truncated_batch(batch, batches):
             "user_id": batch["user_id"], "tender_id": batch["tender_id"],
             "file_hash": batch["file_hash"], "batch_index": child["batch_index"],
             "chunk_refs": child["chunk_refs"], "parent_batch_id": batch_id,
+            "subdivision_depth": int(batch.get("subdivision_depth", 0)) + 1,
+            "estimated_output_tokens": max(400, int(batch.get("estimated_output_tokens", 0)) // max(1, len(plan))),
+            "analysis_work_policy": batch.get("analysis_work_policy", {}),
             "is_overview_batch": bool(batch.get("is_overview_batch", False)),
             "short_tender": bool(batch.get("short_tender", False)),
             "prompt_version": batch.get("prompt_version") or current_app.config.get("ANALYSIS_PROMPT_VERSION", PROMPT_VERSION),
-            "status": "pending", "attempt_count": 0, "api_call_count": 0, "retry_count": 0,
+            "status": "pending", "attempt_count": 0, "provider_window_attempt_count": 0,
+            "api_call_count": 0, "retry_count": 0,
             "total_tokens": 0, "api_attempts": [], "created_at": _now(), "updated_at": _now(),
         }}, upsert=True)
     batches.update_one({"_id": batch_id}, {"$set": {
@@ -1797,16 +2425,12 @@ def _split_truncated_batch(batch, batches):
 
 def _eligible_manual_review_batch(analysis_id, batches, max_retries):
     for batch in batches.find({"analysis_id": analysis_id, "status": "manual_review"}):
-        attempt_count = int(batch.get("attempt_count", 0))
-        retry_count = int(batch.get("manual_review_retry_count", 0))
         reason = batch.get("manual_review_reason")
         legacy_truncation = (
             batch.get("finish_reason") == "MAX_TOKENS"
             and "exceeded the output limit when isolated" in str(batch.get("error_message", ""))
         )
-        if (attempt_count < max_retries and retry_count < 1 and
-                (reason in {"output_truncated_single_reference", "incomplete_json_single_reference"}
-                 or legacy_truncation)):
+        if reason in {"output_truncated_single_reference", "incomplete_json_single_reference"} or legacy_truncation:
             return batch
     return None
 
@@ -1815,7 +2439,7 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
     batch = batches.find_one({"analysis_id": analysis["_id"], "status": "split_pending"},
                              sort=[("batch_index", ASCENDING)])
     if batch:
-        _split_truncated_batch(batch, batches)
+        _split_truncated_batch(batch, batches, chunks)
         return True
 
     lease_seconds = int(current_app.config.get("ANALYSIS_LEASE_SECONDS", 300))
@@ -1824,11 +2448,7 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
 
     # Atomically claim a pending or retryable batch
     batch = batches.find_one_and_update(
-        {
-            "analysis_id": analysis["_id"],
-            "status": {"$in": ["pending", "failed"]},
-            "$or": [{"attempt_count": {"$exists": False}}, {"attempt_count": {"$lt": max_retries}}],
-        },
+        _batch_claim_query(analysis, now, max_retries),
         {
             "$set": {
                 "status": "processing",
@@ -1867,13 +2487,10 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
                 return_document=ReturnDocument.AFTER,
             )
     if not batch:
-        _recover_stale_batches(analysis["_id"], batches, lease_seconds, max_retries)
+        _recover_stale_batches(analysis["_id"], batches, lease_seconds, max_retries,
+                               analysis.get("provider_policy_version", 0), len(analysis.get("provider_order", [])))
         batch = batches.find_one_and_update(
-            {
-                "analysis_id": analysis["_id"],
-                "status": {"$in": ["pending", "failed"]},
-                "$or": [{"attempt_count": {"$exists": False}}, {"attempt_count": {"$lt": max_retries}}],
-            },
+            _batch_claim_query(analysis, now, max_retries),
             {
                 "$set": {
                     "status": "processing",
@@ -1887,14 +2504,13 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
             sort=[("batch_index", ASCENDING)],
             return_document=ReturnDocument.AFTER,
         )
+    manual_recovery = False
     if not batch and analysis.get("_allow_manual_review_retry"):
         manual = _eligible_manual_review_batch(analysis["_id"], batches, max_retries)
         if manual:
             batch = batches.find_one_and_update(
                 {
                     "_id": manual["_id"], "status": "manual_review",
-                    "manual_review_retry_count": {"$ne": 1},
-                    "attempt_count": {"$lt": max_retries},
                 },
                 {"$set": {
                     "status": "processing", "processing_token": token,
@@ -1903,8 +2519,17 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
                 }, "$inc": {"manual_review_retry_count": 1}},
                 return_document=ReturnDocument.AFTER,
             )
+            manual_recovery = batch is not None
     if not batch:
         return False
+
+    if manual_recovery:
+        batches.update_one({"_id": batch["_id"], "processing_token": token}, {"$set": {
+            "status": "split_pending", "completed_at": None, "updated_at": _now(),
+            "error_message": "Resuming manual review by subdividing the saved source range.",
+        }})
+        _split_truncated_batch({**batch, "status": "split_pending"}, batches, chunks)
+        return True
 
     batch_metadata = {}
     current_prompt_version = current_app.config.get("ANALYSIS_PROMPT_VERSION", PROMPT_VERSION)
@@ -1918,36 +2543,100 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
         batches.update_one({"_id": batch["_id"]}, {"$set": batch_metadata})
         batch.update(batch_metadata)
     if batch.get("status") == "split_pending":
-        _split_truncated_batch(batch, batches)
+        _split_truncated_batch(batch, batches, chunks)
         return True
 
     try:
         refs = batch.get("chunk_refs", [])
-        indexes = [ref["chunk_index"] for ref in refs]
+        indexes = sorted({ref["chunk_index"] for ref in refs})
         rows = list(chunks.find({
             "user_id": analysis["user_id"], "tender_id": analysis["tender_id"],
             "file_hash": analysis["file_hash"], "chunk_index": {"$in": indexes},
-        }, {"chunk_index": 1, "page_number": 1, "text": 1}))
+        }, {"chunk_index": 1, "page_number": 1, "text": 1, "char_start": 1}))
         by_index = {row["chunk_index"]: row for row in rows}
-        if len(by_index) != len(refs):
+        if len(by_index) != len(indexes):
             raise AnalysisError("Saved PDF text changed or is incomplete. Reprocess the tender before analysis.", 409)
         passages = []
+        normalized_refs = []
+        invalid_refs = []
         for ref in refs:
             source = by_index[ref["chunk_index"]]
             if source.get("page_number") != ref["page_number"]:
                 raise AnalysisError("Saved PDF page references changed. Reprocess the tender before analysis.", 409)
-            passages.append(f"[SOURCE PAGE {ref['page_number']}]\n{source.get('text', '')}\n[/SOURCE PAGE]")
+            source_text = source.get("text", "")
+            start = max(0, int(ref.get("text_start", 0)))
+            end = min(len(source_text), int(ref.get("text_end", len(source_text))))
+            if start >= len(source_text) or end <= start:
+                invalid_refs.append({**ref, "source_length": len(source_text)})
+                continue
+            normalized_ref = dict(ref)
+            if normalized_ref.get("text_start") is not None or normalized_ref.get("text_end") is not None:
+                normalized_ref.update({"text_start": start, "text_end": end})
+                page_start = normalized_ref.get("source_start")
+                if page_start is None and isinstance(source.get("char_start"), int):
+                    page_start = source["char_start"] + start
+                normalized_ref.update({
+                    "source_start": page_start,
+                    "source_end": page_start + end - start if page_start is not None else None,
+                })
+            normalized_refs.append(normalized_ref)
+            source_start = normalized_ref.get("source_start")
+            source_end = normalized_ref.get("source_end")
+            offset_label = f"; source characters {source_start}-{source_end}" if source_start is not None else ""
+            passages.append(f"[SOURCE PAGE {ref['page_number']}{offset_label}]\n{source_text[start:end]}\n[/SOURCE PAGE]")
+        if not normalized_refs:
+            batches.update_one({"_id": batch["_id"], "processing_token": token}, {"$set": {
+                "status": "skipped", "completed_at": _now(),
+                "skipped_reason": "Saved source range was outside the available extracted text.",
+                "skipped_text_ranges": [{
+                    "page_number": ref.get("page_number"), "chunk_index": ref.get("chunk_index"),
+                    "text_start": ref.get("text_start"), "text_end": ref.get("text_end"),
+                    "source_length": ref.get("source_length"),
+                } for ref in invalid_refs],
+                "error_message": "Saved source range was outside available extracted text; passage skipped.",
+                "last_activity_at": _now(), "updated_at": _now(),
+            }})
+            return True
+        if invalid_refs:
+            raise AnalysisError("A batch contains both valid and invalid saved source ranges; refusing partial processing.", 409)
+        if normalized_refs != refs:
+            batches.update_one({"_id": batch["_id"], "processing_token": token}, {"$set": {
+                "chunk_refs": normalized_refs, "last_activity_at": _now(), "updated_at": _now(),
+            }})
+            batch["chunk_refs"] = normalized_refs
         overview_instruction = ("Extract structured overview fields explicitly supported by these passages: tender identity, dates, fees/security, and important conditions.\n\n") if batch.get("is_overview_batch") else "Extract requirements only. In overview, return important_conditions only if new, explicit conditions occur in this batch; do not repeat tender identity fields.\n\n"
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": USER_PREFIX + overview_instruction + "\n\n".join(passages)},
         ]
         estimate = _estimate_tokens("".join(message["content"] for message in messages))
-        if estimate > _max_input():
-            raise AnalysisError("A saved batch exceeded the token budget and was not sent.", 413)
+        batch["_request_output_tokens"] = _request_output_budget(
+            batch, _expected_output_tokens(_estimate_tokens("\n".join(passages)), batch)
+        )
+        if estimate > _max_input(analysis):
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "status": "split_pending", "failure_category": "input_budget",
+                "completed_at": None, "error_message": "Source segment exceeded the input budget; subdividing before sending.",
+                "last_activity_at": _now(), "updated_at": _now(),
+            }})
+            _split_truncated_batch({**batch, "status": "split_pending"}, batches, chunks)
+            return True
+        try:
+            _tpm_output_budget(estimate, batch["_request_output_tokens"], batch)
+        except AnalysisError as error:
+            if error.status_code != 413:
+                raise
+            batches.update_one({"_id": batch["_id"]}, {"$set": {
+                "status": "split_pending", "failure_category": "output_budget",
+                "completed_at": None, "error_message": "Insufficient output budget for source segment; subdividing before sending.",
+                "last_activity_at": _now(), "updated_at": _now(),
+            }})
+            _split_truncated_batch({**batch, "status": "split_pending"}, batches, chunks)
+            return True
 
         batches.update_one({"_id": batch["_id"]}, {"$set": {"last_activity_at": _now()}})
-        result, estimate, actual_in, actual_out, actual_thinking, actual_total, request_ms = _gemini_request(
+        request_fn = _provider_request if analysis.get("provider_policy_version") == 1 else _gemini_request
+        result, estimate, actual_in, actual_out, actual_thinking, actual_total, request_ms = request_fn(
             messages, analysis, batch, analyses, batches, token,
         )
         usage_values = {}
@@ -1981,58 +2670,43 @@ def _process_batch(analysis, token, analyses, batches, requirements, pages, chun
         finish_reason = _response_finish_reason(result)
 
         if str(finish_reason).casefold() in {"length", "max_tokens"}:
-            partial_overview, partial_reqs = _extract_partial_response(_response_text(result))
-            saved_partial_count = _save_requirements(
-                partial_reqs, analysis, batch, pages, requirements, preliminary=True
-            ) if partial_reqs else 0
-            if partial_overview:
-                if not batch.get("is_overview_batch") and isinstance(partial_overview, dict):
-                    partial_overview = {"important_conditions": partial_overview.get("important_conditions")}
-                overview_fields = _validated_overview_fields(partial_overview, analysis, batch, pages)
-                if overview_fields:
-                    merged_overview = _merge_overview_fields(analysis.get("overview_fields", {}), overview_fields)
-                    analyses.update_one({"_id": analysis["_id"], "processing_token": token},
-                                        {"$set": {"overview_fields": merged_overview, "updated_at": _now()}})
+            # Keep only independently validated findings recovered from complete
+            # objects in a truncated response. Reasoning is never exposed here;
+            # the provider adapter supplies only message.content as result.text.
+            _, partial_items = _extract_partial_response(_response_text(result))
+            partial_count = _save_requirements(
+                partial_items, analysis, batch, pages, requirements,
+                preliminary=True, verified_only=True,
+            ) if partial_items else 0
             batches.update_one({"_id": batch["_id"]}, {"$set": {
                 "status": "split_pending", "finish_reason": finish_reason,
                 "completed_at": None, "last_activity_at": _now(), "updated_at": _now(),
-                "partial_requirement_count": saved_partial_count,
+                "partial_requirement_count": partial_count,
                 "failure_category": "output_truncated",
-                "error_message": "Gemini reached the output-token limit. The source references will be retried in smaller tasks.",
+                "error_message": "Provider output was truncated. Source ranges will be retried in smaller tasks.",
             }})
-            _logger.warning("Tender analysis batch=%d output was truncated; preserved %d validated preliminary findings before splitting", batch["batch_index"], saved_partial_count)
-            _split_truncated_batch({**batch, "status": "split_pending", "finish_reason": finish_reason}, batches)
+            _logger.warning("Tender analysis batch=%d output was truncated; splitting source ranges", batch["batch_index"])
+            _split_truncated_batch({**batch, "status": "split_pending", "finish_reason": finish_reason}, batches, chunks)
             return True
 
         response_text = _response_text(result)
         try:
             parsed = _parse_response(response_text)
         except AnalysisResponseError as error:
-            partial_overview, partial_reqs = _extract_partial_response(response_text)
-            saved_partial_count = _save_requirements(
-                partial_reqs, analysis, batch, pages, requirements, preliminary=True
-            ) if partial_reqs else 0
-            if partial_overview and isinstance(partial_overview, dict):
-                if not batch.get("is_overview_batch"):
-                    partial_overview = {"important_conditions": partial_overview.get("important_conditions")}
-                partial_fields = _validated_overview_fields(partial_overview, analysis, batch, pages)
-                if partial_fields:
-                    merged_overview = _merge_overview_fields(analysis.get("overview_fields", {}), partial_fields)
-                    analyses.update_one({"_id": analysis["_id"], "processing_token": token},
-                                        {"$set": {"overview_fields": merged_overview, "updated_at": _now()}})
-            if saved_partial_count:
-                batches.update_one({"_id": batch["_id"]}, {"$set": {
-                    "partial_requirement_count": saved_partial_count,
-                }})
             if error.incomplete:
+                _, partial_items = _extract_partial_response(response_text)
+                partial_count = _save_requirements(
+                    partial_items, analysis, batch, pages, requirements,
+                    preliminary=True, verified_only=True,
+                ) if partial_items else 0
                 split_reason = "incomplete_json"
                 batches.update_one({"_id": batch["_id"]}, {"$set": {
                     "status": "split_pending", "finish_reason": finish_reason or "INCOMPLETE_JSON",
-                    "failure_category": split_reason, "partial_requirement_count": saved_partial_count,
+                    "failure_category": split_reason, "partial_requirement_count": partial_count,
                     "completed_at": None, "last_activity_at": _now(), "updated_at": _now(),
-                    "error_message": "Gemini returned incomplete JSON. The source references will be retried in smaller tasks.",
+                    "error_message": "Provider returned incomplete JSON. Source ranges will be retried in smaller tasks.",
                 }})
-                _split_truncated_batch({**batch, "status": "split_pending", "failure_category": split_reason}, batches)
+                _split_truncated_batch({**batch, "status": "split_pending", "failure_category": split_reason}, batches, chunks)
                 return True
             batches.update_one({"_id": batch["_id"]}, {"$set": {"failure_category": error.error_category}})
             raise
@@ -2082,15 +2756,20 @@ def _batch_progress(analysis_id, batches):
     max_retries = max(1, min(5, int(current_app.config.get("ANALYSIS_RETRY_ATTEMPTS", 3))))
     logical = [row for row in rows if row.get("status") != "split"]
     failed = [row for row in logical if row.get("status") == "failed"]
+    completed = sum(row.get("status") == "completed" for row in logical)
+    skipped = sum(row.get("status") == "skipped" for row in logical)
     return {
         "total_batches": len(logical),
-        "completed_batches": sum(row.get("status") == "completed" for row in logical),
+        "completed_batches": completed,
+        "processing_completion_ratio": round((completed + skipped) / max(len(logical), 1), 4),
         "processing_batches": sum(row.get("status") == "processing" for row in logical),
         "pending_batches": sum(row.get("status") in {"pending", "split_pending"} for row in logical),
+        "retrying_batches": sum(row.get("status") == "retrying" for row in logical),
         "manual_review_batches": sum(row.get("status") == "manual_review" for row in logical),
+        "skipped_batches": skipped,
         "split_batches": sum(row.get("status") == "split" for row in rows),
-        "retrying_batches": sum(
-            0 < row.get("attempt_count", 0) < max_retries
+        "retryable_failed_batches": sum(
+            not row.get("terminal_failure") and 0 < row.get("attempt_count", 0) < max_retries
             for row in failed
         ),
         "failed_batches": len(failed),
@@ -2106,9 +2785,12 @@ def _summary(analysis, extraction_status=None, in_progress=False, progress=None)
         "extraction_status": extraction_status, "page_count": analysis.get("page_count", 0),
         "progress": progress or {"total_batches": analysis.get("total_batches", 0),
                      "completed_batches": analysis.get("completed_batches", 0),
+                     "processing_completion_ratio": analysis.get("processing_completion_ratio", 0),
                      "processing_batches": analysis.get("processing_batches", 0),
                      "pending_batches": analysis.get("pending_batches", 0),
+                     "retrying_batches": analysis.get("retrying_batches", 0),
                      "manual_review_batches": analysis.get("manual_review_batches", 0),
+                     "skipped_batches": analysis.get("skipped_batches", 0),
                      "split_batches": analysis.get("split_batches", 0),
                      "retrying_batches": analysis.get("retrying_batches", 0),
                      "failed_batches": analysis.get("failed_batches", 0)},
@@ -2158,19 +2840,38 @@ def _public_analysis(analysis, requirements, batches=None):
         "evidence_text": 1, "source_evidence": 1, "validation_status": 1, "preliminary": 1,
         "eligible_for_phase7": 1, "validation_reasons": 1,
     }).sort([("source_page", ASCENDING), ("category", ASCENDING)]))
+    if batches is not None:
+        skipped = list(batches.find({"analysis_id": analysis["_id"], "status": "skipped"}, {
+            "_id": 1, "skipped_reason": 1, "skipped_text_ranges": 1,
+        }))
+        output["skipped_passages"] = [{
+            "batch_id": str(row.get("_id")), "reason": row.get("skipped_reason"),
+            "ranges": row.get("skipped_text_ranges", []),
+        } for row in skipped]
+        counts = _batch_progress(analysis["_id"], batches)
+        output["resume_result"] = {
+            "unresolved_batches": counts["pending_batches"] + counts["processing_batches"] +
+                                  counts["retrying_batches"] + counts["failed_batches"] + counts["manual_review_batches"],
+            "skipped_batches": counts["skipped_batches"],
+            "message": ("Some batches still require review." if counts["manual_review_batches"] or counts["failed_batches"]
+                        else "Some source passages were skipped." if counts["skipped_batches"]
+                        else "All eligible batch work is complete."),
+        }
     return output
 
 
-def _refresh_counts(analysis, analyses, batches, requirements, status_override=None, message=None, chunks=None):
+def _refresh_counts(analysis, analyses, batches, requirements, status_override=None, message=None, chunks=None, pages=None):
     aid = analysis["_id"]
     lease_seconds = int(current_app.config.get("ANALYSIS_LEASE_SECONDS", 300))
     max_retries = max(1, min(5, int(current_app.config.get("ANALYSIS_RETRY_ATTEMPTS", 3))))
-    _recover_stale_batches(aid, batches, lease_seconds, max_retries)
+    _recover_stale_batches(aid, batches, lease_seconds, max_retries,
+                           analysis.get("provider_policy_version", 0), len(analysis.get("provider_order", [])))
 
     progress = _batch_progress(aid, batches)
     total = progress["total_batches"]
     completed = progress["completed_batches"]
     failed = progress["failed_batches"]
+    skipped = progress["skipped_batches"]
     manual_review = batches.count_documents({"analysis_id": aid, "status": "manual_review"})
     processing = progress["processing_batches"]
     pending = progress["pending_batches"]
@@ -2180,7 +2881,7 @@ def _refresh_counts(analysis, analyses, batches, requirements, status_override=N
     phase7_eligible = requirements.count_documents({"analysis_id": aid, "eligible_for_phase7": True})
     review = total_reqs - verified
 
-    coverage = _calculate_actual_coverage(analysis, batches, chunks)
+    coverage = _calculate_actual_coverage(analysis, batches, chunks, pages)
 
     if status_override:
         status = status_override
@@ -2188,6 +2889,10 @@ def _refresh_counts(analysis, analyses, batches, requirements, status_override=N
         status = "failed"
     elif pending > 0 or processing > 0:
         status = "processing"
+    elif progress["retrying_batches"] > 0:
+        status = "paused_rate_limit"
+    elif skipped > 0 and manual_review == 0:
+        status = "completed_with_warnings"
     elif manual_review > 0 or not coverage.get("complete"):
         status = "needs_review"
     elif review > 0 or not phase7_eligible:
@@ -2195,21 +2900,39 @@ def _refresh_counts(analysis, analyses, batches, requirements, status_override=N
     else:
         status = "completed"
 
+    failed_row = batches.find_one({"analysis_id": aid, "status": "failed"}, sort=[("last_activity_at", -1)])
+    if status_override:
+        status_message = message
+    elif status == "failed":
+        status_message = message or (failed_row.get("error_message") if failed_row else "A batch failed permanently.")
+    elif status == "paused_rate_limit":
+        status_message = message or "Provider cooldown is active; retryable work is persisted for Resume."
+    elif status == "needs_review" and manual_review:
+        status_message = message or f"{manual_review} batch(es) require manual review."
+    elif status == "needs_review" and review:
+        status_message = message or f"{review} finding(s) require verification."
+    elif status == "needs_review" and not coverage.get("complete"):
+        status_message = message or f"Text coverage is incomplete; {coverage.get('unexamined_text_chars', 0)} characters remain unexamined."
+    elif status == "completed_with_warnings":
+        status_message = message or f"{skipped} source work unit(s) were skipped under the bounded recovery policy."
+    else:
+        status_message = message
     now = _now()
     run_start = _as_utc(analysis.get("active_started_at", now))
     elapsed = max(0.0, (now - run_start).total_seconds() * 1000)
     total_elapsed = round(analysis.get("total_processing_ms", 0) + elapsed, 1)
     analyses.update_one({"_id": aid}, {"$set": {
         "status": status, "total_batches": total, "completed_batches": completed,
+        "processing_completion_ratio": progress["processing_completion_ratio"],
         "processing_batches": processing, "pending_batches": pending, "failed_batches": failed,
         "split_batches": progress["split_batches"], "retrying_batches": progress["retrying_batches"],
-        "manual_review_batches": manual_review,
+        "manual_review_batches": manual_review, "skipped_batches": skipped,
         "coverage": coverage,
         "requirement_count": total_reqs, "verified_requirement_count": verified,
         "review_requirement_count": review, "phase7_eligible_count": phase7_eligible,
         "total_processing_ms": total_elapsed,
-        "updated_at": now, "error_message": message,
-        "processing_finished_at": now if status in {"completed", "needs_review", "failed"} else None,
+        "updated_at": now, "error_message": status_message,
+        "processing_finished_at": now if status in {"completed", "completed_with_warnings", "needs_review", "failed"} else None,
         "lease_until": None if status != "processing" else analysis.get("lease_until"),
     }, "$unset": {"processing_token": "", "active_started_at": ""}})
     return status
@@ -2330,10 +3053,11 @@ def _advance(analysis, analyses, batches, requirements, pages, chunks):
     max_retries = max(1, min(5, int(current_app.config.get("ANALYSIS_RETRY_ATTEMPTS", 3))))
     manual_review_retry = _eligible_manual_review_batch(analysis["_id"], batches, max_retries)
     was_needs_review = analysis.get("status") == "needs_review"
-    if analysis.get("status") == "completed" or (
-        analysis.get("status") == "needs_review" and manual_review_retry is None
-    ):
-        return _public_analysis(analysis, requirements)
+    if analysis.get("status") in {"completed", "completed_with_warnings"}:
+        if analysis.get("status") == "completed_with_warnings":
+            _refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
+            analysis = analyses.find_one({"_id": analysis["_id"]}) or analysis
+        return _public_analysis(analysis, requirements, batches)
     token = uuid4().hex
     claim = analyses.find_one_and_update({"_id": analysis["_id"], "$or": [
         {"status": {"$ne": "processing"}}, {"lease_until": {"$lte": now}},
@@ -2379,7 +3103,7 @@ def _advance(analysis, analyses, batches, requirements, pages, chunks):
         else:
             _refresh_counts(claim, analyses, batches, requirements, chunks=chunks)
         latest = analyses.find_one({"_id": claim["_id"]})
-        return _public_analysis(latest, requirements) | {"in_progress": False}
+        return _public_analysis(latest, requirements, batches) | {"in_progress": False}
     except AnalysisPaused as error:
         paused_at = _now()
         active_start = _as_utc(claim.get("active_started_at", paused_at))
@@ -2387,18 +3111,19 @@ def _advance(analysis, analyses, batches, requirements, pages, chunks):
         active_batch = batches.find_one({"analysis_id": claim["_id"], "status": "processing"})
         if active_batch:
             batches.update_one({"_id": active_batch["_id"]}, {"$set": {
-                "status": "pending", "error_message": str(error), "last_activity_at": paused_at, "updated_at": paused_at,
+                "status": "retrying", "error_message": str(error), "last_activity_at": paused_at, "updated_at": paused_at,
                 "retry_after_seconds": error.retry_after,
+                "retry_at": paused_at + timedelta(seconds=max(0.0, error.retry_after or 0.0)),
             }})
         analyses.update_one({"_id": claim["_id"], "processing_token": token}, {
-            "$set": {"status": "paused_rate_limit", "pause_reason": "daily_quota" if error.daily_quota else "rate_limit",
+            "$set": {"status": "paused_rate_limit", "pause_reason": error.reason or ("daily_quota" if error.daily_quota else "rate_limit"),
                      "error_message": str(error), "lease_until": None, "updated_at": paused_at,
                      "total_processing_ms": round(claim.get("total_processing_ms", 0) + elapsed, 1),
                      "pause_until": paused_at + timedelta(seconds=max(0.0, error.retry_after or 0.0)),
                      "retry_after_seconds": max(0.0, error.retry_after or 0.0)},
             "$unset": {"processing_token": "", "active_started_at": ""},
         })
-        return _public_analysis(analyses.find_one({"_id": claim["_id"]}), requirements)
+        return _public_analysis(analyses.find_one({"_id": claim["_id"]}), requirements, batches)
     except (AnalysisError, PyMongoError) as error:
         active_batch = batches.find_one({"analysis_id": claim["_id"], "status": "processing"})
         diagnostic = getattr(error, "_agent1_mongo_diagnostic", None)
