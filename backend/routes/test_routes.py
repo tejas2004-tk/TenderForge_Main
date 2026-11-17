@@ -2,7 +2,7 @@ from flask import Blueprint, current_app, jsonify
 from pymongo.errors import PyMongoError
 
 from database import get_database
-from services.groq_service import GroqServiceError, test_groq_connection
+from services.gemini_service import GeminiServiceError, test_gemini_connection
 
 test_bp = Blueprint("tests", __name__)
 
@@ -16,10 +16,13 @@ def test_database():
         return jsonify({"status": "error", "message": "MongoDB connection failed. Check backend configuration and Atlas network access."}), 503
 
 
-@test_bp.get("/test-groq")
-def test_groq():
+@test_bp.get("/test-gemini")
+def test_gemini():
+    model = current_app.config["GEMINI_MODEL"]
     try:
-        answer = test_groq_connection(current_app.config["GROQ_API_KEY"], current_app.config["GROQ_MODEL"])
-        return jsonify({"status": "connected", "message": answer}), 200
-    except GroqServiceError as error:
-        return jsonify({"status": "error", "message": str(error)}), error.status_code
+        answer = test_gemini_connection(
+            current_app.config["GEMINI_API_KEY"], model, current_app.config,
+        )
+        return jsonify({"status": "connected", "model": model, "message": answer}), 200
+    except GeminiServiceError as error:
+        return jsonify({"status": "error", "model": model, "message": str(error)}), error.status_code

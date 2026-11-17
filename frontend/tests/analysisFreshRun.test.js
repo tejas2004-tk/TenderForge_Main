@@ -10,7 +10,7 @@ import {
 test("fresh analysis requires explicit quota confirmation", () => {
   let message = "";
   assert.equal(confirmFreshAnalysis((value) => { message = value; return false; }), false);
-  assert.match(message, /Groq API quota/);
+  assert.match(message, /Gemini API quota/);
   assert.match(message, /Previous analysis results will be kept/);
   assert.equal(confirmFreshAnalysis(() => true), true);
   assert.match(FRESH_RUN_CONFIRMATION, /fresh Agent 1 analysis/);

@@ -1,4 +1,4 @@
-export const FRESH_RUN_CONFIRMATION = "Start a completely fresh Agent 1 analysis using the latest code? This may consume Groq API quota. Previous analysis results will be kept.";
+export const FRESH_RUN_CONFIRMATION = "Start a completely fresh Agent 1 analysis using the latest code? This may consume Gemini API quota. Previous analysis results will be kept.";
 
 export function canStartFreshAnalysis(analysis, working) {
   return Boolean(

@@ -136,8 +136,9 @@ def assess_document_ocr_status(
     empty_pages = sum(1 for p in page_infos if p.is_empty)
     scanned_pages = sum(1 for p in page_infos if p.is_scanned)
 
-    # Scanned PDF rule: more than half the pages are scanned/image-only
-    needs_ocr = page_count > 0 and (scanned_pages > page_count / 2)
+    # Any scanned page needs explicit OCR handling so its source text is not
+    # silently omitted from an otherwise processable mixed document.
+    needs_ocr = scanned_pages > 0
 
     if needs_ocr:
         return DocumentValidationSummary(
@@ -147,7 +148,10 @@ def assess_document_ocr_status(
             scanned_pages_count=scanned_pages,
             needs_ocr=True,
             status="needs_ocr",
-            error_message="This PDF appears to be scanned and cannot currently be processed without OCR.",
+            error_message=(
+                f"This PDF has {scanned_pages} scanned page(s) and cannot currently "
+                "be processed without OCR."
+            ),
         )
 
     if total_chars == 0:

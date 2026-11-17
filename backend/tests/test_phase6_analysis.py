@@ -1,14 +1,17 @@
-"""Isolated Phase 6 tests. All Groq and collection interactions are mocked."""
+"""Isolated Phase 6 tests. All Gemini and collection interactions are mocked."""
 import sys
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import httpx
 from flask import Flask
-from groq import APIConnectionError, RateLimitError
+from google.genai import errors as genai_errors
+from pymongo.errors import OperationFailure
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services import tender_analysis_service as service
@@ -126,6 +129,8 @@ class MemoryCollection:
             for item in values:
                 if item not in row[key]:
                     row[key].append(item)
+        for key, value in update.get("$push", {}).items():
+            row.setdefault(key, []).append(value)
         for key in update.get("$unset", {}):
             row.pop(key, None)
 
@@ -134,7 +139,7 @@ class Phase6AnalysisTests(unittest.TestCase):
     def setUp(self):
         self.app = Flask(__name__)
         self.app.config.update(
-            GROQ_API_KEY="mock-key", GROQ_MODEL="mock-model",
+            GEMINI_API_KEY="mock-key", GEMINI_MODEL="mock-model",
             ANALYSIS_MAX_INPUT_TOKENS=6000, ANALYSIS_MAX_OUTPUT_TOKENS=1400,
             ANALYSIS_RETRY_ATTEMPTS=3, ANALYSIS_RETRY_BASE_SECONDS=2,
             ANALYSIS_REQUEST_INTERVAL_SECONDS=0,
@@ -148,74 +153,372 @@ class Phase6AnalysisTests(unittest.TestCase):
     def _rate_error(self, headers=None, body=None):
         request = httpx.Request("POST", "https://example.invalid")
         response = httpx.Response(429, headers=headers or {}, request=request)
-        return RateLimitError("rate limited", response=response, body=body or {"error": {"message": "temporary rate limit"}})
+        return genai_errors.APIError(429, body or {"error": {"message": "temporary rate limit", "status": "RESOURCE_EXHAUSTED"}}, response=response)
+
+    def _status_error(self, status_code, code="invalid_request", message="unsupported parameter"):
+        request = httpx.Request("POST", "https://example.invalid")
+        response = httpx.Response(status_code, request=request)
+        return genai_errors.APIError(
+            status_code,
+            {"error": {"code": code, "status": "INVALID_ARGUMENT", "message": message}},
+            response=response,
+        )
+
+    def test_provider_rejections_are_specific_persisted_and_not_retried(self):
+        for status_code in (400, 401, 403, 404, 413):
+            with self.subTest(status_code=status_code):
+                fake_client = Mock()
+                fake_client.models.generate_content.side_effect = self._status_error(
+                    status_code, message=f"provider detail {status_code}"
+                )
+                analysis = {"_id": "analysis", "model_id": "mock-model", "processing_token": "token"}
+                batch = {"_id": "batch", "batch_index": 0, "estimated_output_tokens": 900}
+                analyses = MemoryCollection([analysis])
+                batches = MemoryCollection([batch])
+                with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
+                    with self.assertRaises(service.AnalysisError) as caught:
+                        service._gemini_request([{"content": "hello"}], analysis, batch,
+                                              analyses, batches, "token")
+                self.assertIn(f"HTTP {status_code}", str(caught.exception))
+                if status_code not in (401, 403, 404):
+                    self.assertIn(f"provider detail {status_code}", str(caught.exception))
+                fake_client.models.generate_content.assert_called_once()
+                diagnostic = analyses.rows[0]["provider_diagnostic"]
+                self.assertEqual(diagnostic["status_code"], status_code)
+                self.assertEqual(diagnostic["provider_code"], "INVALID_ARGUMENT")
+                attempt = batches.rows[0]["api_attempts"][0]
+                self.assertEqual(attempt["request_diagnostic"]["max_output_tokens"], 1400)
+                self.assertNotIn("max_tokens", attempt["request_diagnostic"])
+
+    def test_provider_5xx_is_retried_with_bounded_backoff(self):
+        fake_client = Mock()
+        fake_client.models.generate_content.side_effect = [
+            self._status_error(503, code="overloaded", message="temporary provider failure"),
+            self._status_error(503, code="overloaded", message="temporary provider failure"),
+        ]
+        self.app.config["ANALYSIS_RETRY_ATTEMPTS"] = 2
+        analysis = {"_id": "analysis", "model_id": "mock-model", "processing_token": "token"}
+        batch = {"_id": "batch", "batch_index": 0, "estimated_output_tokens": 900}
+        analyses = MemoryCollection([analysis])
+        batches = MemoryCollection([batch])
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"), \
+                patch.object(service.time, "sleep") as sleep:
+            with self.assertRaises(service.AnalysisError) as caught:
+                service._gemini_request([{"content": "hello"}], analysis, batch,
+                                      analyses, batches, "token")
+        self.assertIn("HTTP 503", str(caught.exception))
+        self.assertEqual(fake_client.models.generate_content.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_provider_503_retry_after_pauses_without_ignoring_cooldown(self):
+        request = httpx.Request("POST", "https://example.invalid")
+        response = httpx.Response(503, headers={"Retry-After": "19"}, request=request)
+        error = genai_errors.APIError(
+            503,
+            {"error": {"code": 503, "status": "UNAVAILABLE", "message": "high demand"}},
+            response=response,
+        )
+        fake_client = Mock()
+        fake_client.models.generate_content.side_effect = error
+        analysis = {"_id": "analysis", "model_id": "mock-model", "processing_token": "token"}
+        batch = {"_id": "batch", "batch_index": 0, "estimated_output_tokens": 900}
+        analyses, batches = MemoryCollection([analysis]), MemoryCollection([batch])
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"), \
+                patch.object(service.time, "sleep") as sleep:
+            with self.assertRaises(service.AnalysisPaused) as caught:
+                service._gemini_request([{"content": "hello"}], analysis, batch, analyses, batches, "token")
+        self.assertEqual(caught.exception.retry_after, 19.0)
+        self.assertFalse(caught.exception.daily_quota)
+        self.assertEqual(fake_client.models.generate_content.call_count, 1)
+        sleep.assert_not_called()
+        attempt = batches.rows[0]["api_attempts"][0]
+        self.assertEqual(attempt["provider_http_status"], 503)
+        self.assertEqual(attempt["provider_diagnostic"]["provider_code"], "UNAVAILABLE")
+        self.assertEqual(attempt["retry_after_seconds"], 19.0)
+
+    def test_output_allowance_increases_and_stays_inside_tpm_budget(self):
+        with patch.dict(service.current_app.config, {
+            "ANALYSIS_MAX_OUTPUT_TOKENS": 4000, "ANALYSIS_MAX_TPM_TOKENS": 8000,
+        }):
+            requested = service._request_output_budget({"estimated_output_tokens": 100})
+            self.assertEqual(requested, 2400)
+            self.assertEqual(service._tpm_output_budget(5893, requested), 2107)
+
+    def test_timeout_is_retried_with_bounded_backoff(self):
+        fake_client = Mock()
+        fake_client.models.generate_content.side_effect = TimeoutError("request timed out")
+        self.app.config["ANALYSIS_RETRY_ATTEMPTS"] = 2
+        analysis = {"_id": "analysis", "model_id": "mock-model", "processing_token": "token"}
+        batch = {"_id": "batch", "batch_index": 0, "estimated_output_tokens": 900}
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"), \
+                patch.object(service.time, "sleep") as sleep:
+            with self.assertRaises(service.AnalysisError) as caught:
+                service._gemini_request([{"content": "hello"}], analysis, batch,
+                                        MemoryCollection([analysis]), MemoryCollection([batch]), "token")
+        self.assertIn("timed out", str(caught.exception))
+        self.assertEqual(fake_client.models.generate_content.call_count, 2)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertEqual(fake_client.models.generate_content.call_args.kwargs["config"]["response_mime_type"], "application/json")
+
+    def test_structured_json_request_uses_google_json_schema(self):
+        result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"overview": {}, "requirements": []}'))],
+            usage=SimpleNamespace(prompt_tokens=20, completion_tokens=8),
+        )
+        fake_client = Mock()
+        fake_client.models.generate_content.return_value = result
+        analysis = {"_id": "analysis", "model_id": "mock-model", "processing_token": "token"}
+        batch = {"_id": "batch", "batch_index": 0, "estimated_output_tokens": 900}
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
+            service._gemini_request([{"role": "system", "content": "system"}, {"role": "user", "content": "Return JSON"}],
+                                    analysis, batch, MemoryCollection([analysis]), MemoryCollection([batch]), "token")
+        call = fake_client.models.generate_content.call_args.kwargs
+        self.assertEqual(call["model"], "mock-model")
+        self.assertEqual(call["contents"], "Return JSON")
+        self.assertEqual(call["config"]["response_mime_type"], "application/json")
+        self.assertIn("response_json_schema", call["config"])
+        self.assertEqual(call["config"]["thinking_config"]["thinking_level"], "LOW")
+        self.assertEqual(fake_client.models.generate_content.call_count, 1)
+
+    def test_missing_and_incomplete_structured_json_are_classified(self):
+        for content, expected in (
+            ("", "incomplete_json"),
+            ('{"overview": {}, "requirements": [', "incomplete_json"),
+            ('{"overview": nope, "requirements": []}', "malformed_json"),
+            ('{"overview": {}}', "incomplete_json"),
+        ):
+            with self.subTest(content=content):
+                with self.assertRaises(service.AnalysisResponseError) as caught:
+                    service._parse_response(content)
+                self.assertEqual(caught.exception.error_category, expected)
+
+    def test_thinking_usage_is_recorded_and_included_in_provider_totals(self):
+        result = SimpleNamespace(
+            candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+            text='{"overview": {}, "requirements": []}',
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=44, candidates_token_count=12,
+                thoughts_token_count=900, tool_use_prompt_token_count=3,
+                total_token_count=959,
+            ),
+        )
+        analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result)
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
+            service._process_batch(analysis, "lease", analyses, batches, MemoryCollection(), pages, chunks)
+        self.assertEqual(analyses.rows[0]["actual_thinking_tokens"], 900)
+        self.assertEqual(analyses.rows[0]["actual_provider_total_tokens"], 959)
+        self.assertEqual(analyses.rows[0]["total_tokens"], 959)
+        attempt = batches.rows[0]["api_attempts"][0]
+        self.assertEqual(attempt["provider_http_status"], 200)
+        self.assertEqual(attempt["provider_thinking_tokens"], 900)
+        self.assertEqual(attempt["provider_total_tokens"], 959)
+        self.assertEqual(batches.rows[0]["actual_thinking_tokens"], 900)
+
+    def test_empty_structured_generation_is_rejected_locally(self):
+        empty_result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=""))],
+            usage=SimpleNamespace(prompt_tokens=20, completion_tokens=0),
+        )
+        fake_client = Mock()
+        fake_client.models.generate_content.return_value = empty_result
+        analysis = {"_id": "analysis", "model_id": "mock-model", "processing_token": "token"}
+        batch = {"_id": "batch", "batch_index": 0, "estimated_output_tokens": 900}
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
+            result = service._gemini_request(
+                [{"content": "Return JSON"}], analysis, batch,
+                MemoryCollection([analysis]), MemoryCollection([batch]), "token",
+            )
+        with self.assertRaises(service.AnalysisError) as caught:
+            service._parse_response(service._response_text(result[0]))
+        self.assertIn("empty analysis response", str(caught.exception))
+
+    def test_summary_exposes_safe_provider_diagnostic(self):
+        summary = service._summary({
+            "_id": "analysis",
+            "status": "failed",
+            "provider_diagnostic": {
+                "operation": "google.genai.models.generate_content",
+                "endpoint": "https://generativelanguage.googleapis.com/v1beta/models",
+                "status_code": 400,
+                "provider_code": "invalid_request",
+                "provider_type": "invalid_request_error",
+                "provider_message": "bad parameter",
+                "model": "openai/gpt-oss-120b",
+                "estimated_input_tokens": 123,
+                "max_output_tokens": 1200,
+                "temperature": 0,
+                "response_mime_type": "application/json",
+            },
+        })
+        self.assertEqual(summary["provider_diagnostic"]["status_code"], 400)
+        self.assertEqual(summary["provider_diagnostic"]["provider_message"], "bad parameter")
+        self.assertNotIn("api_key", json.dumps(summary).casefold())
+
+    def test_new_analysis_records_gemini_provider_and_fixed_model(self):
+        with patch.dict(service.current_app.config, {"GEMINI_MODEL": "gemini-test-model", "ANALYSIS_VERSION": "6"}):
+            record = service._new_analysis_record(
+                {"analysis_version": "7", "user_id": "u", "tender_id": "t", "file_hash": "h"},
+                {"page_count": 1, "extracted_pages": 1},
+            )
+        self.assertEqual(record["provider"], "gemini")
+        self.assertEqual(record["model_id"], "gemini-test-model")
+
+    def test_legacy_groq_analysis_remains_readable_and_cannot_resume(self):
+        user = {"_id": "user"}
+        tender = {"_id": "tender", "sha256": "hash"}
+        legacy = {"_id": "legacy", "model_id": "llama-3.1-8b-instant", "status": "failed"}
+        summary = service._summary(legacy)
+        self.assertEqual(summary["provider"], "groq")
+        collections = (MemoryCollection([legacy]), MemoryCollection(), MemoryCollection(),
+                       MemoryCollection(), MemoryCollection(), MemoryCollection())
+        with patch.object(service, "_find_owned_tender", return_value=tender), \
+                patch.object(service, "_ready_extraction"), \
+                patch.object(service, "_collections", return_value=collections), \
+                patch.object(service, "_latest_analysis", return_value=legacy), \
+                patch.object(service, "_advance") as advance:
+            with self.assertRaises(service.AnalysisError) as caught:
+                service.resume_analysis(user, "tender")
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertIn("fresh Gemini analysis", str(caught.exception))
+        advance.assert_not_called()
 
     def test_retry_after_numeric_and_http_date_are_respected(self):
         error = self._rate_error({"Retry-After": "12.5"})
         self.assertEqual(service._retry_after(error), 12.5)
-        error = self._rate_error({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})
-        self.assertEqual(service._retry_after(error), 0.0)
+        now = datetime(2026, 11, 17, 6, 28, 5, tzinfo=timezone.utc)
+        with patch.object(service, "_now", return_value=now):
+            error = self._rate_error({"Retry-After": format_datetime(now + timedelta(seconds=15), usegmt=True)})
+            self.assertEqual(service._retry_after(error), 15.0)
 
     def test_missing_reset_headers_use_persistable_fallback_without_sleeping(self):
         analysis = {"_id": "analysis", "model_id": "mock-model"}
         batch = {"_id": "batch", "batch_index": 0}
         fake_client = Mock()
-        fake_client.chat.completions.create.side_effect = self._rate_error({"Retry-After": "not-a-delay"})
-        with patch.object(service, "Groq", return_value=fake_client), patch.object(service, "_pace"), \
+        fake_client.models.generate_content.side_effect = self._rate_error({"Retry-After": "not-a-delay"})
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"), \
                 patch.object(service.time, "sleep") as sleep:
             with self.assertRaises(service.AnalysisPaused) as caught:
-                service._groq_request([{"content": "hello"}], analysis, batch,
+                service._gemini_request([{"content": "hello"}], analysis, batch,
                                       MemoryCollection(), MemoryCollection(), "token")
         self.assertEqual(caught.exception.retry_after, 60)
-        fake_client.chat.completions.create.assert_called_once()
+        fake_client.models.generate_content.assert_called_once()
         sleep.assert_not_called()
 
-    def test_groq_reset_headers_are_used_when_retry_after_is_missing(self):
+    def test_provider_reset_headers_are_used_when_retry_after_is_missing(self):
         error = self._rate_error({"x-ratelimit-reset-tokens": "2m3s", "x-ratelimit-reset-requests": "10s"})
         self.assertEqual(service._rate_limit_cooldown(error), 123)
 
+    def test_retry_delay_in_error_body_is_used(self):
+        error = self._rate_error(
+            body={"error": {"message": "Please try again in 3.3 seconds.", "code": "rate_limit_exceeded"}}
+        )
+        self.assertEqual(service._rate_limit_cooldown(error), 3.3)
+        error = self._rate_error(
+            body={"error": {"retry_after": "3.3s", "code": "rate_limit_exceeded"}}
+        )
+        self.assertEqual(service._rate_limit_cooldown(error), 3.3)
+
+    def test_conflicting_retry_metadata_prefers_retry_after_and_logs_selection(self):
+        error = self._rate_error({
+            "Retry-After": "3.3",
+            "x-ratelimit-reset-tokens": "3600000",
+        })
+        with patch.object(service._logger, "warning") as warning:
+            cooldown, source = service._rate_limit_cooldown_details(error)
+        self.assertEqual(cooldown, 3.3)
+        self.assertEqual(source, "Retry-After header")
+        warning.assert_called_once()
+
+    def test_numeric_reset_metadata_supports_milliseconds_without_hours_of_pause(self):
+        now = datetime(2026, 11, 17, 6, 28, 5, tzinfo=timezone.utc)
+        with patch.object(service, "_now", return_value=now):
+            self.assertEqual(service._parse_reset_seconds("3600000"), 3600)
+            self.assertAlmostEqual(
+                service._parse_reset_seconds(str(int((now.timestamp() + 3.3) * 1000))),
+                3.3,
+                places=2,
+            )
+
     def test_valid_retry_after_is_used_for_retry(self):
         fake_client = Mock()
-        fake_client.chat.completions.create.side_effect = self._rate_error({"Retry-After": "17"})
+        fake_client.models.generate_content.side_effect = self._rate_error({"Retry-After": "17"})
         sleeps = []
-        with patch.object(service, "Groq", return_value=fake_client), patch.object(service, "_pace"), \
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"), \
                 patch.object(service.time, "sleep", side_effect=lambda seconds: sleeps.append(seconds)):
             with self.assertRaises(service.AnalysisPaused) as caught:
-                service._groq_request([{"content": "hello"}], {"_id": "a", "model_id": "m"},
+                service._gemini_request([{"content": "hello"}], {"_id": "a", "model_id": "m"},
                                       {"_id": "b", "batch_index": 0}, MemoryCollection(), MemoryCollection(), "t")
         self.assertEqual(caught.exception.retry_after, 17.0)
         self.assertEqual(sleeps, [])
 
+    def test_output_budget_is_capped_by_combined_tpm_limit(self):
+        result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"requirements": []}'))],
+            usage=SimpleNamespace(prompt_tokens=23, completion_tokens=12),
+        )
+        fake_client = Mock()
+        fake_client.models.generate_content.return_value = result
+        with patch.dict(service.current_app.config, {"ANALYSIS_MAX_TPM_TOKENS": 300}), \
+                patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
+            service._gemini_request(
+                [{"content": "hello"}],
+                {"_id": "a", "model_id": "m"},
+                {"_id": "b", "batch_index": 0, "estimated_output_tokens": 900},
+                MemoryCollection(), MemoryCollection(), "t",
+            )
+        self.assertEqual(fake_client.models.generate_content.call_args.kwargs["config"]["max_output_tokens"], 277)
+
     def test_temporary_rate_limit_pauses_with_resume_delay(self):
         fake_client = Mock()
-        fake_client.chat.completions.create.side_effect = self._rate_error({"Retry-After": "9"})
+        fake_client.models.generate_content.side_effect = self._rate_error({"Retry-After": "9"})
         self.app.config["ANALYSIS_RETRY_ATTEMPTS"] = 1
-        with patch.object(service, "Groq", return_value=fake_client), patch.object(service, "_pace"):
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
             with self.assertRaises(service.AnalysisPaused) as caught:
-                service._groq_request([{"content": "x"}], {"_id": "a", "model_id": "m"},
+                service._gemini_request([{"content": "x"}], {"_id": "a", "model_id": "m"},
                                       {"_id": "b", "batch_index": 0}, MemoryCollection(), MemoryCollection(), "t")
         self.assertFalse(caught.exception.daily_quota)
         self.assertEqual(caught.exception.retry_after, 9.0)
 
+    def test_invalid_retry_metadata_uses_short_configured_fallback(self):
+        error = self._rate_error({
+            "Retry-After": "not-a-delay",
+            "x-ratelimit-reset-tokens": "not-a-reset",
+        })
+        with patch.dict(service.current_app.config, {"ANALYSIS_RATE_LIMIT_FALLBACK_SECONDS": 60}):
+            self.assertEqual(service._rate_limit_cooldown(error), 60)
+
+    def test_pause_persists_provider_delay_and_retry_timestamp(self):
+        fixed_now = datetime(2026, 11, 17, 6, 28, 5, tzinfo=timezone.utc)
+        analysis = {"_id": "analysis", "status": "pending", "plan_ready": True, "total_batches": 1,
+                    "active_started_at": fixed_now, "coverage": {}}
+        analyses = MemoryCollection([analysis])
+        batches = MemoryCollection([{"_id": "batch", "analysis_id": "analysis", "status": "processing"}])
+        with patch.object(service, "_now", return_value=fixed_now), \
+                patch.object(service, "_process_batch",
+                             side_effect=service.AnalysisPaused("temporary", retry_after=3.3)):
+            result = service._advance(analysis, analyses, batches, MemoryCollection(), MemoryCollection(), MemoryCollection())
+        self.assertEqual(result["retry_after_seconds"], 3.3)
+        self.assertEqual(analyses.rows[0]["pause_until"], fixed_now + timedelta(seconds=3.3))
+
     def test_daily_quota_pauses_separately_without_retry(self):
         fake_client = Mock()
-        fake_client.chat.completions.create.side_effect = self._rate_error(
+        fake_client.models.generate_content.side_effect = self._rate_error(
             {"Retry-After": "90"}, {"error": {"message": "Daily quota exceeded", "code": "insufficient_quota"}}
         )
-        with patch.object(service, "Groq", return_value=fake_client), patch.object(service, "_pace"):
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
             with self.assertRaises(service.AnalysisPaused) as caught:
-                service._groq_request([{"content": "x"}], {"_id": "a", "model_id": "m"},
+                service._gemini_request([{"content": "x"}], {"_id": "a", "model_id": "m"},
                                       {"_id": "b", "batch_index": 0}, MemoryCollection(), MemoryCollection(), "t")
         self.assertTrue(caught.exception.daily_quota)
         self.assertEqual(caught.exception.retry_after, 90)
-        fake_client.chat.completions.create.assert_called_once()
+        fake_client.models.generate_content.assert_called_once()
 
     def _batch_inputs(self, result):
         analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash",
-                    "model_id": "mock-model", "overview_fields": {}}
+                    "provider": "gemini", "model_id": "mock-model", "overview_fields": {}}
         batch = {"_id": "batch", "analysis_id": "analysis", "batch_index": 0,
                  "user_id": "user", "tender_id": "tender", "file_hash": "hash",
-                 "is_overview_batch": True, "prompt_version": "4",
+                 "is_overview_batch": True, "prompt_version": "5",
                  "chunk_refs": [{"chunk_index": 1, "page_number": 1}], "status": "pending"}
         batches = MemoryCollection([batch])
         analyses = MemoryCollection([dict(analysis, processing_token="lease")])
@@ -224,22 +527,23 @@ class Phase6AnalysisTests(unittest.TestCase):
         pages = MemoryCollection([{"page_number": 1, "part_index": 0, "complete": True,
                                    "text": "The bidder shall submit certificate."}])
         fake_client = Mock()
-        fake_client.chat.completions.create.return_value = result
+        fake_client.models.generate_content.return_value = result
         return analysis, batch, analyses, batches, pages, chunks, fake_client
 
-    def test_malformed_json_keeps_usage_and_raises_resumable_error(self):
+    def test_incomplete_json_keeps_usage_and_splits_for_recovery(self):
         result = SimpleNamespace(
             choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"requirements": ['))],
             usage=SimpleNamespace(prompt_tokens=44, completion_tokens=12),
         )
         analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result)
         requirements = MemoryCollection()
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
-            with self.assertRaises(service.AnalysisError):
-                service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
+            self.assertTrue(service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks))
         saved = analyses.rows[0]
         self.assertEqual((saved["request_count"], saved["actual_input_tokens"], saved["actual_output_tokens"]), (1, 44, 12))
         self.assertEqual(requirements.rows, [])
+        self.assertEqual(batches.rows[0]["status"], "manual_review")
+        self.assertEqual(batches.rows[0]["failure_category"], "incomplete_json")
 
     def test_advance_marks_malformed_batch_failed_and_resume_eligible(self):
         result = SimpleNamespace(
@@ -254,15 +558,16 @@ class Phase6AnalysisTests(unittest.TestCase):
             choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"overview": {}, "requirements": []}'))],
             usage=SimpleNamespace(prompt_tokens=44, completion_tokens=10),
         )
-        client.chat.completions.create.side_effect = [result, recovered]
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
+        client.models.generate_content.side_effect = [result, recovered]
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
             response = service._advance(analyses.rows[0], analyses, batches, requirements, pages, chunks)
-            self.assertEqual(response["status"], "failed")
-            self.assertEqual(batches.rows[0]["status"], "failed")
+            self.assertEqual(response["status"], "needs_review")
+            self.assertEqual(batches.rows[0]["status"], "manual_review")
             self.assertIsNone(analyses.rows[0].get("processing_token"))
             response = service._advance(analyses.rows[0], analyses, batches, requirements, pages, chunks)
         self.assertEqual(response["status"], "needs_review")
         self.assertEqual(batches.rows[0]["status"], "completed")
+        self.assertEqual(batches.rows[0]["manual_review_retry_count"], 1)
 
     def test_truncated_response_is_failed_before_findings_are_saved(self):
         result = SimpleNamespace(
@@ -279,7 +584,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         untouched_pending = {"_id": "already-pending", "analysis_id": "analysis", "batch_index": 1,
                              "status": "pending", "chunk_refs": [{"chunk_index": 3, "page_number": 3}]}
         batches.rows.append(untouched_pending)
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"), \
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"), \
                 patch.object(service, "_save_requirements") as save:
             service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
         save.assert_not_called()
@@ -289,7 +594,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual({tuple((ref["chunk_index"], ref["page_number"]) for ref in child["chunk_refs"]) for child in children},
                          {((1, 1),), ((2, 2),)})
         self.assertTrue(all(child["user_id"] == "user" and child["tender_id"] == "tender" and child["file_hash"] == "hash" for child in children))
-        self.assertTrue(all(child["is_overview_batch"] and child["prompt_version"] == "4" for child in children))
+        self.assertTrue(all(child["is_overview_batch"] and child["prompt_version"] == "5" for child in children))
         self.assertEqual(untouched_pending["status"], "pending")
         self.assertEqual(analyses.rows[0]["actual_output_tokens"], 1400)
         self.assertEqual(requirements.rows, [])
@@ -304,21 +609,91 @@ class Phase6AnalysisTests(unittest.TestCase):
                       chunk_refs=[{"chunk_index": 1, "page_number": 1}, {"chunk_index": 2, "page_number": 2}])
         child = {"_id": "child", "analysis_id": "analysis", "user_id": "user", "tender_id": "tender",
                  "file_hash": "hash", "batch_index": 2, "parent_batch_id": "batch", "status": "pending",
-                 "attempt_count": 0, "is_overview_batch": False, "prompt_version": "4",
+                 "attempt_count": 0, "is_overview_batch": False, "prompt_version": "5",
                  "chunk_refs": [{"chunk_index": 2, "page_number": 2}]}
         batches = MemoryCollection([parent, child])
         chunks.rows.append({"chunk_index": 2, "page_number": 2, "text": "Page two requirement.",
                             "user_id": "user", "tender_id": "tender", "file_hash": "hash"})
         requirements = MemoryCollection()
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
             service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
-        sent = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        sent = client.models.generate_content.call_args.kwargs["contents"]
         self.assertIn("SOURCE PAGE 2", sent)
         self.assertNotIn("SOURCE PAGE 1", sent)
         self.assertEqual(batches.rows[0]["status"], "split")
         self.assertEqual(batches.rows[1]["status"], "completed")
-        self.assertEqual(batches.rows[1]["prompt_version"], "4")
+        self.assertEqual(batches.rows[1]["prompt_version"], "5")
         self.assertFalse(batches.rows[1]["is_overview_batch"])
+
+    def test_resume_retries_only_manual_child_and_preserves_completed_findings(self):
+        evidence = "The bidder must have supplied similar equipment for 3 years."
+        result = SimpleNamespace(
+            candidates=[SimpleNamespace(finish_reason=SimpleNamespace(name="STOP"))],
+            text=json.dumps({"overview": {}, "requirements": [{
+                "category": "Experience Requirements",
+                "requirement_title": "Similar equipment experience",
+                "description": "The bidder must have supplied similar equipment for 3 years",
+                "requirement_value": "3 years", "mandatory": True,
+                "requirement_status": "mandatory", "source_page": 1,
+                "evidence_text": evidence, "extraction_status": "extracted",
+            }]}),
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=40, candidates_token_count=80,
+                thoughts_token_count=40, total_token_count=160,
+            ),
+        )
+        analysis = {
+            "_id": "analysis", "status": "needs_review", "plan_ready": True,
+            "total_batches": 2, "page_count": 1, "user_id": "user",
+            "tender_id": "tender", "file_hash": "hash", "provider": "gemini",
+            "model_id": "mock-model", "overview_fields": {},
+            "processing_token": None, "created_at": service._now(),
+        }
+        analyses = MemoryCollection([analysis])
+        completed = {
+            "_id": "completed", "analysis_id": "analysis", "batch_index": 0,
+            "user_id": "user", "tender_id": "tender", "file_hash": "hash",
+            "status": "completed", "attempt_count": 1, "api_call_count": 1,
+            "chunk_refs": [{"chunk_index": 1, "page_number": 1}],
+        }
+        manual = {
+            "_id": "manual-child", "analysis_id": "analysis", "batch_index": 2,
+            "parent_batch_id": "split-parent", "user_id": "user", "tender_id": "tender",
+            "file_hash": "hash", "status": "manual_review", "attempt_count": 1,
+            "api_call_count": 1, "finish_reason": "MAX_TOKENS",
+            "manual_review_reason": "output_truncated_single_reference",
+            "chunk_refs": [{"chunk_index": 2, "page_number": 1}],
+            "prompt_version": "5", "is_overview_batch": False,
+        }
+        batches = MemoryCollection([completed, manual])
+        pages = MemoryCollection([{
+            "user_id": "user", "tender_id": "tender", "file_hash": "hash",
+            "page_number": 1, "part_index": 0, "complete": True, "text": evidence,
+        }])
+        chunks = MemoryCollection([
+            {"user_id": "user", "tender_id": "tender", "file_hash": "hash",
+             "chunk_index": index, "page_number": 1, "text": evidence}
+            for index in (1, 2)
+        ])
+        requirements = MemoryCollection()
+        service._save_requirements([self._raw_requirement(1, evidence)], analysis, completed, pages, requirements)
+        self.assertEqual(len(requirements.rows), 1)
+        fake_client = Mock()
+        fake_client.models.generate_content.return_value = result
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
+            service._advance(analyses.rows[0], analyses, batches, requirements, pages, chunks)
+        self.assertEqual(fake_client.models.generate_content.call_count, 1)
+        completed_saved = next(row for row in batches.rows if row["_id"] == "completed")
+        manual_saved = next(row for row in batches.rows if row["_id"] == "manual-child")
+        self.assertEqual(completed_saved["status"], "completed")
+        self.assertEqual(completed_saved["api_call_count"], 1)
+        self.assertEqual(manual_saved["status"], "completed")
+        self.assertEqual(manual_saved["manual_review_retry_count"], 1)
+        self.assertEqual(len(requirements.rows), 1)
+        self.assertEqual(
+            {row["evidence_text"] for row in requirements.rows[0]["source_evidence"]},
+            {evidence},
+        )
 
     def test_splitting_overview_batch_preserves_overview_extraction(self):
         response = SimpleNamespace(
@@ -339,11 +714,11 @@ class Phase6AnalysisTests(unittest.TestCase):
         pages.rows.append({"page_number": 2, "part_index": 0, "complete": True, "text": "Second page text."})
         service._split_truncated_batch(batches.rows[0], batches)
         children = [row for row in batches.rows if row.get("parent_batch_id") == "batch"]
-        self.assertTrue(all(row["is_overview_batch"] and row["prompt_version"] == "4" for row in children))
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"), \
+        self.assertTrue(all(row["is_overview_batch"] and row["prompt_version"] == "5" for row in children))
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"), \
                 patch.object(service, "_validated_overview_fields", wraps=service._validated_overview_fields) as validate:
             service._process_batch(analysis, "lease", analyses, batches, MemoryCollection(), pages, chunks)
-        sent_prompt = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        sent_prompt = client.models.generate_content.call_args.kwargs["contents"]
         self.assertIn("tender identity", sent_prompt)
         self.assertIn("tender_title", validate.call_args.args[0])
 
@@ -380,7 +755,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         user_id, tender_id, file_hash = "user", "tender", "hash"
         old_created = service._now() - service.timedelta(days=1)
         old_analysis = {"_id": "old-run", "user_id": user_id, "tender_id": tender_id, "file_hash": file_hash,
-                        "analysis_version": "5", "analysis_logic_version": "5", "prompt_version": "4",
+                        "analysis_version": "5", "analysis_logic_version": "5", "prompt_version": "5",
                         "status": status, "created_at": old_created, "updated_at": old_created,
                         "page_count": 11, "extracted_pages": 11, "overview_parts": [], "overview_fields": {},
                         "requirements_count": 1, "requirement_count": 1, "verified_requirement_count": 1,
@@ -403,16 +778,16 @@ class Phase6AnalysisTests(unittest.TestCase):
         with patch.object(service, "_find_owned_tender", return_value=tender), \
                 patch.object(service, "_ready_extraction", return_value={"page_count": 11, "extracted_pages": 11}), \
                 patch.object(service, "_collections", return_value=collections), \
-                patch.object(service, "_advance", return_value={"status": "processing", "analysis_version": "6"}) as advance:
+                patch.object(service, "_advance", return_value={"status": "processing", "analysis_version": "7"}) as advance:
             first, started = service.start_fresh_analysis(user, "tender", request_id="fresh-request-1")
             second, duplicate_started = service.start_fresh_analysis(user, "tender", request_id="fresh-request-1")
         self.assertTrue(started)
         self.assertFalse(duplicate_started)
-        self.assertEqual(first["analysis_version"], "6")
-        self.assertEqual(second["analysis_version"], "6")
+        self.assertEqual(first["analysis_version"], "7")
+        self.assertEqual(second["analysis_version"], "7")
         self.assertEqual(analyses.rows[0]["status"], "needs_review")
-        self.assertEqual(analyses.rows[1]["analysis_logic_version"], "5")
-        self.assertEqual(analyses.rows[1]["prompt_version"], "4")
+        self.assertEqual(analyses.rows[1]["analysis_logic_version"], "6")
+        self.assertEqual(analyses.rows[1]["prompt_version"], "5")
         self.assertEqual(analyses.rows[1]["run_origin"], "fresh")
         self.assertNotEqual(analyses.rows[0]["_id"], analyses.rows[1]["_id"])
         self.assertEqual(requirements.rows[0]["analysis_id"], "old-run")
@@ -503,21 +878,21 @@ class Phase6AnalysisTests(unittest.TestCase):
             usage=SimpleNamespace(prompt_tokens=44, completion_tokens=12),
         )
         analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result)
-        client.chat.completions.create.side_effect = self._rate_error()
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"), \
+        client.models.generate_content.side_effect = self._rate_error()
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"), \
                 patch.object(service.time, "sleep"):
             with self.assertRaises(service.AnalysisPaused):
                 service._process_batch(analysis, "lease", analyses, batches, MemoryCollection(), pages, chunks)
             batches.rows[0]["status"] = "pending"  # Simulate a safe later resume after cooldown.
-            client.chat.completions.create.side_effect = None
-            client.chat.completions.create.return_value = result
+            client.models.generate_content.side_effect = None
+            client.models.generate_content.return_value = result
             service._process_batch(analysis, "lease", analyses, batches, MemoryCollection(), pages, chunks)
         saved = analyses.rows[0]
         self.assertEqual(saved["request_count"], 2)
         self.assertEqual(saved["unknown_usage_requests"], 1)
         self.assertEqual(saved["actual_input_tokens"], 44)
         self.assertEqual(saved["actual_output_tokens"], 12)
-        self.assertEqual(saved["prompt_versions_used"], ["4"])
+        self.assertEqual(saved["prompt_versions_used"], ["5"])
 
     def test_evidence_requires_contiguous_text_unless_ellipsis_is_explicit(self):
         source = "THE bidder shall, SUBMIT its valid certificate."
@@ -577,6 +952,149 @@ class Phase6AnalysisTests(unittest.TestCase):
         service._save_requirements(raw, analysis, batch, pages, requirements)
         self.assertEqual(len(requirements.rows), 1)
         self.assertEqual(len(requirements.rows[0]["source_evidence"]), 1)
+
+    def test_bulk_write_failure_preserves_original_mongo_exception_and_logs_context(self):
+        class FailingRequirements(MemoryCollection):
+            def bulk_write(self, operations, ordered=False):
+                raise OperationFailure("duplicate key on requirement_key", code=11000)
+
+        analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        batch = {"_id": "batch-7", "batch_index": 7, "chunk_refs": [{"page_number": 1}]}
+        evidence = "The bidder must have supplied similar equipment for 3 years."
+        pages = MemoryCollection([{
+            "user_id": "user", "tender_id": "tender", "file_hash": "hash",
+            "page_number": 1, "part_index": 0, "complete": True, "text": evidence,
+        }])
+        with patch.object(service._logger, "exception") as log:
+            with self.assertRaises(OperationFailure) as caught:
+                service._save_requirements(
+                    [self._raw_requirement(1, evidence)], analysis, batch, pages, FailingRequirements()
+                )
+        self.assertIn("duplicate key", str(caught.exception))
+        log.assert_called_once()
+        self.assertEqual(log.call_args.args[0], "Agent 1 MongoDB write failed")
+        self.assertEqual(log.call_args.kwargs["extra"]["operation"], "requirements.bulk_write")
+        self.assertEqual(log.call_args.kwargs["extra"]["batch_id"], "batch-7")
+        self.assertEqual(log.call_args.kwargs["extra"]["batch_index"], 7)
+        self.assertEqual(log.call_args.kwargs["extra"]["exception_type"], "OperationFailure")
+
+    def test_bulk_write_diagnostic_is_persisted_on_analysis_and_batch(self):
+        class FailingRequirements(MemoryCollection):
+            def bulk_write(self, operations, ordered=False):
+                raise OperationFailure("duplicate key on requirement_key", code=11000)
+
+        result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+                content='{"overview": {}, "requirements": [{"category": "Experience Requirements", '
+                        '"requirement_title": "Experience", "description": "The bidder must have supplied similar equipment for 3 years", '
+                        '"requirement_value": "3 years", "mandatory": true, "source_page": 1, '
+                        '"evidence_text": "The bidder must have supplied similar equipment for 3 years."}]}'))],
+            usage=SimpleNamespace(prompt_tokens=44, completion_tokens=12),
+        )
+        analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result)
+        analysis.update({"plan_ready": True, "status": "pending", "total_batches": 1})
+        analyses = MemoryCollection([dict(analysis)])
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"), \
+                patch.object(service._logger, "exception"):
+            response = service._advance(
+                analyses.rows[0], analyses, batches, FailingRequirements(), pages, chunks
+            )
+        self.assertEqual(response["status"], "failed")
+        diagnostic = analyses.rows[0]["mongo_diagnostic"]
+        self.assertEqual(diagnostic["operation"], "requirements.bulk_write")
+        self.assertEqual(diagnostic["batch_id"], "batch")
+        self.assertEqual(diagnostic["exception_type"], "OperationFailure")
+        self.assertIn("duplicate key", diagnostic["exception_message"])
+        self.assertEqual(batches.rows[0]["mongo_diagnostic"], diagnostic)
+
+    def test_original_write_error_survives_failed_status_write(self):
+        class FailingRequirements(MemoryCollection):
+            def bulk_write(self, operations, ordered=False):
+                raise OperationFailure("duplicate key on requirement_key", code=11000)
+
+        class FailingStatusBatches(MemoryCollection):
+            def update_one(self, query, update, upsert=False):
+                if update.get("$set", {}).get("status") == "failed":
+                    raise RuntimeError("status update unavailable")
+                return super().update_one(query, update, upsert)
+
+        result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+                content='{"overview": {}, "requirements": [{"category": "Experience Requirements", '
+                        '"requirement_title": "Experience", "description": "The bidder must have supplied similar equipment for 3 years", '
+                        '"requirement_value": "3 years", "mandatory": true, "source_page": 1, '
+                        '"evidence_text": "The bidder must have supplied similar equipment for 3 years."}]}'))],
+            usage=SimpleNamespace(prompt_tokens=44, completion_tokens=12),
+        )
+        analysis, batch, analyses, _, pages, chunks, client = self._batch_inputs(result)
+        batches = FailingStatusBatches([batch])
+        messages = []
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"), \
+                patch.object(service._logger, "exception", side_effect=lambda message, **kwargs: messages.append(message)):
+            with self.assertRaises(OperationFailure) as caught:
+                service._process_batch(
+                    analysis, "lease", analyses, batches, FailingRequirements(), pages, chunks
+                )
+        self.assertIn("duplicate key", str(caught.exception))
+        self.assertIn("Agent 1 MongoDB write failed", messages)
+        self.assertIn("Agent 1 failed to persist batch failure status", messages)
+
+    def test_legacy_preliminary_conflict_failed_batch_gets_one_safe_resume(self):
+        result = SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+                content='{"overview": {}, "requirements": []}'))],
+            usage=SimpleNamespace(prompt_tokens=44, completion_tokens=12),
+        )
+        analysis, batch, analyses, batches, pages, chunks, client = self._batch_inputs(result)
+        batches.rows[0].update({
+            "status": "failed", "attempt_count": 3,
+            "error_message": "batch op errors occurred, code': 40, Updating the path 'preliminary'",
+        })
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
+            service._process_batch(analysis, "lease", analyses, batches, MemoryCollection(), pages, chunks)
+        self.assertEqual(batches.rows[0]["status"], "completed")
+        self.assertTrue(batches.rows[0]["legacy_retry_used"])
+
+    def test_summary_exposes_redacted_safe_diagnostics(self):
+        analysis = {
+            "_id": "analysis", "mongo_diagnostic": {
+                "operation": "requirements.bulk_write", "batch_id": "batch-1", "batch_index": 1,
+                "exception_type": "OperationFailure",
+                "exception_message": "mongodb+srv://user:secret@example/db duplicate key",
+                "error_code": 11000, "timestamp": service._now(),
+            },
+        }
+        summary = service._summary(analysis)
+        self.assertEqual(summary["mongo_diagnostic"]["error_code"], 11000)
+        self.assertNotIn("secret", summary["mongo_diagnostic"]["exception_message"])
+        self.assertEqual(summary["mongo_diagnostic"]["operation"], "requirements.bulk_write")
+
+    def test_preliminary_and_final_upserts_do_not_overlap_update_operators(self):
+        analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+        evidence = "The bidder must have supplied similar equipment for 3 years."
+        batch = {"batch_index": 0, "chunk_refs": [{"page_number": 1}]}
+        pages = MemoryCollection([{
+            "user_id": "user", "tender_id": "tender", "file_hash": "hash",
+            "page_number": 1, "part_index": 0, "complete": True, "text": evidence,
+        }])
+        requirements = MemoryCollection()
+        raw = [self._raw_requirement(1, evidence)]
+
+        service._save_requirements(raw, analysis, batch, pages, requirements, preliminary=True)
+        preliminary_update = requirements.updates[-1][1]
+        self.assertEqual(preliminary_update["$setOnInsert"]["preliminary"], True)
+        self.assertNotIn("preliminary", preliminary_update.get("$set", {}))
+        self.assertTrue(set(preliminary_update.get("$setOnInsert", {})).isdisjoint(
+            preliminary_update.get("$set", {})
+        ))
+
+        service._save_requirements(raw, analysis, batch, pages, requirements, preliminary=False)
+        final_update = requirements.updates[-1][1]
+        self.assertNotIn("preliminary", final_update.get("$setOnInsert", {}))
+        self.assertEqual(final_update["$set"]["preliminary"], False)
+        self.assertTrue(set(final_update.get("$setOnInsert", {})).isdisjoint(
+            final_update.get("$set", {})
+        ))
 
     def test_distinct_values_remain_separate_and_conflicted_for_review(self):
         analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
@@ -745,7 +1263,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(item["requirement_status"], "mandatory")
         self.assertTrue(item["mandatory"])
 
-    def test_groq_output_token_truncation_and_task_splitting(self):
+    def test_gemini_output_token_truncation_and_task_splitting(self):
         result = SimpleNamespace(
             choices=[SimpleNamespace(finish_reason="length", message=SimpleNamespace(content='{"requirements": ['))],
             usage=SimpleNamespace(prompt_tokens=50, completion_tokens=1400),
@@ -758,20 +1276,20 @@ class Phase6AnalysisTests(unittest.TestCase):
         pages.rows.append({"page_number": 2, "part_index": 0, "complete": True, "text": "Page two requirement."})
         requirements = MemoryCollection()
 
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
             worked = service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
 
         self.assertTrue(worked)
         self.assertEqual(batches.rows[0]["status"], "split")
-        self.assertEqual(batches.rows[0]["finish_reason"], "length")
+        self.assertEqual(batches.rows[0]["finish_reason"], "MAX_TOKENS")
         self.assertIn("Truncated task was split into smaller resumable tasks", batches.rows[0]["error_message"])
         children = [r for r in batches.rows if r.get("parent_batch_id") == "batch"]
         self.assertEqual(len(children), 2)
         self.assertTrue(all(c["status"] == "pending" for c in children))
         self.assertEqual({c["chunk_refs"][0]["page_number"] for c in children}, {1, 2})
 
-    def test_partial_findings_preserved_without_duplication(self):
-        # Truncated response containing one complete requirement before cutoff
+    def test_truncated_findings_are_preserved_as_preliminary_without_completing_batch(self):
+        # Recovered fragments remain reviewable and never complete their parent batch.
         partial_json = (
             '{"overview": {"tender_title": "Function Generator"}, '
             '"requirements": [{"category": "Technical Requirements", "requirement_title": "Frequency Range", '
@@ -791,33 +1309,17 @@ class Phase6AnalysisTests(unittest.TestCase):
         pages.rows.append({"page_number": 2, "part_index": 0, "complete": True, "text": "Page two requirement."})
         requirements = MemoryCollection()
 
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
+        with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"):
             service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
 
-        # 1. Partial finding was preserved and saved
         self.assertEqual(len(requirements.rows), 1)
-        self.assertEqual(requirements.rows[0]["requirement_title"], "Frequency Range")
-        self.assertEqual(requirements.rows[0]["source_page"], 1)
-
-        # 2. Child batch for page 1 now runs and returns the same requirement with complete stop
-        child_batch = next(r for r in batches.rows if r.get("parent_batch_id") == "batch" and r["chunk_refs"][0]["page_number"] == 1)
-        complete_json = json.dumps({
-            "requirements": [{"category": "Technical Requirements", "requirement_title": "Frequency Range",
-                             "description": "Frequency range 1 MHz to 20 MHz", "requirement_value": "1 MHz to 20 MHz",
-                             "evidence_text": "The bidder shall submit certificate.", "source_page": 1}],
-        })
-        result2 = SimpleNamespace(
-            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=complete_json))],
-            usage=SimpleNamespace(prompt_tokens=40, completion_tokens=80),
-        )
-        client.chat.completions.create.return_value = result2
-
-        with patch.object(service, "Groq", return_value=client), patch.object(service, "_pace"):
-            service._process_batch(analysis, "lease", analyses, batches, requirements, pages, chunks)
-
-        # 3. Assert no duplicate was created; still exactly 1 requirement
+        self.assertTrue(requirements.rows[0]["preliminary"])
+        self.assertEqual(batches.rows[0]["partial_requirement_count"], 1)
+        self.assertNotEqual(batches.rows[0]["status"], "completed")
+        partial = service._extract_partial_response(partial_json)[1]
+        service._save_requirements(partial, analysis, batch, pages, requirements, preliminary=True)
         self.assertEqual(len(requirements.rows), 1)
-        self.assertEqual(requirements.rows[0]["requirement_title"], "Frequency Range")
+        self.assertEqual(len(requirements.rows[0]["source_evidence"]), 1)
 
     def test_interrupted_batch_recovery(self):
         analysis = {"_id": "analysis", "status": "processing", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
@@ -851,10 +1353,10 @@ class Phase6AnalysisTests(unittest.TestCase):
     def test_concurrent_worker_protection(self):
         analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
         b0 = {"_id": "b0", "analysis_id": "analysis", "batch_index": 0, "status": "pending",
-              "user_id": "user", "tender_id": "tender", "file_hash": "hash", "prompt_version": "4",
+              "user_id": "user", "tender_id": "tender", "file_hash": "hash", "prompt_version": "5",
               "chunk_refs": [{"chunk_index": 1, "page_number": 1}]}
         b1 = {"_id": "b1", "analysis_id": "analysis", "batch_index": 1, "status": "pending",
-              "user_id": "user", "tender_id": "tender", "file_hash": "hash", "prompt_version": "4",
+              "user_id": "user", "tender_id": "tender", "file_hash": "hash", "prompt_version": "5",
               "chunk_refs": [{"chunk_index": 2, "page_number": 2}]}
         batches = MemoryCollection([b0, b1])
         analyses = MemoryCollection([analysis])
@@ -869,13 +1371,13 @@ class Phase6AnalysisTests(unittest.TestCase):
         requirements = MemoryCollection()
 
         result = SimpleNamespace(
-            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"requirements": []}'))],
+            choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{"overview": {}, "requirements": []}'))],
             usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10),
         )
         fake_client = Mock()
-        fake_client.chat.completions.create.return_value = result
+        fake_client.models.generate_content.return_value = result
 
-        with patch.object(service, "Groq", return_value=fake_client), patch.object(service, "_pace"):
+        with patch.object(service.genai, "Client", return_value=fake_client), patch.object(service, "_pace"):
             # Worker 1 runs
             w1 = service._process_batch(analysis, "token-w1", analyses, batches, requirements, pages, chunks)
             # Worker 2 runs
@@ -910,6 +1412,27 @@ class Phase6AnalysisTests(unittest.TestCase):
         status = service._refresh_counts(analysis, analyses, batches, requirements, chunks=chunks)
         self.assertEqual(status, "failed")
         self.assertEqual(analyses.rows[0]["status"], "failed")
+
+    def test_live_progress_replaces_split_parent_with_logical_children(self):
+        batches = MemoryCollection([
+            {"_id": "parent", "analysis_id": "analysis", "status": "pending", "attempt_count": 0},
+            {"_id": "other", "analysis_id": "analysis", "status": "pending", "attempt_count": 0},
+        ])
+        initial = service._batch_progress("analysis", batches)
+        self.assertEqual(initial["total_batches"], 2)
+        self.assertEqual(initial["completed_batches"], 0)
+
+        batches.rows[0]["status"] = "split"
+        batches.rows[1]["status"] = "completed"
+        for index in range(4):
+            batches.rows.append({
+                "_id": f"child-{index}", "analysis_id": "analysis",
+                "status": "completed", "attempt_count": 1,
+            })
+        live = service._batch_progress("analysis", batches)
+        self.assertEqual(live["total_batches"], 5)
+        self.assertEqual(live["completed_batches"], 5)
+        self.assertEqual(live["split_batches"], 1)
 
     def test_all_pages_completed_and_saved_before_successful_completion(self):
         analysis = {"_id": "analysis", "total_processing_ms": 0, "user_id": "user", "tender_id": "tender", "file_hash": "hash"}

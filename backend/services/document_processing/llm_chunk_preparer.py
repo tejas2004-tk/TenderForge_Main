@@ -146,7 +146,7 @@ def prepare_llm_ready_chunks(
 
     for item in sorted_by_priority:
         item_tokens = item["estimated_tokens"]
-        if accumulated_tokens + item_tokens <= max_token_budget or not selected_chunks:
+        if accumulated_tokens + item_tokens <= max_token_budget:
             # Include in primary candidate set
             ready_obj = LLMReadyChunk(
                 chunk_index=item["chunk_index"],

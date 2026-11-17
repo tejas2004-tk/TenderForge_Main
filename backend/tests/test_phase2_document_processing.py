@@ -277,6 +277,27 @@ class Phase2DocumentProcessingTests(unittest.TestCase):
         summary = assess_document_ocr_status(2, infos)
         self.assertTrue(summary.needs_ocr)
         self.assertEqual(summary.status, "needs_ocr")
+
+    def test_04b_mixed_scanned_page_requires_ocr(self):
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "Tender terms on the text page.")
+        page = doc.new_page()
+        image_doc = fitz.open()
+        image_page = image_doc.new_page(width=200, height=200)
+        image_page.draw_rect(fitz.Rect(10, 10, 190, 190), color=(1, 0, 0), fill=(0, 1, 0))
+        page.insert_image(fitz.Rect(50, 50, 500, 700), pixmap=image_page.get_pixmap())
+        image_doc.close()
+        pdf_path = Path(self.temp_dir) / "mixed-scanned.pdf"
+        doc.save(pdf_path)
+        doc.close()
+
+        opened = open_and_validate_pdf(pdf_path)
+        infos = [inspect_pdf_page(opened[i], i + 1)[1] for i in range(opened.page_count)]
+        opened.close()
+        summary = assess_document_ocr_status(2, infos)
+        self.assertTrue(summary.needs_ocr)
+        self.assertEqual(summary.status, "needs_ocr")
         self.assertIn("OCR", summary.error_message)
 
     # 5. Repeated headers and footers
@@ -536,6 +557,17 @@ class Phase2DocumentProcessingTests(unittest.TestCase):
         self.assertGreater(len(reserve), 0)
         self.assertEqual(len(selected) + len(reserve), 5)
         self.assertLessEqual(summary["total_selected_tokens"], 70)
+
+    def test_23b_oversized_chunk_stays_in_reserve(self):
+        text = "The bidder must submit EMD and turnover information. " * 100
+        chunk = DocumentChunk(0, 1, [1], text, 0, len(text))
+        classification = score_single_chunk(text, 1, 0)
+        selected, reserve, summary = prepare_llm_ready_chunks(
+            [chunk], [classification], max_token_budget=10
+        )
+        self.assertEqual(selected, [])
+        self.assertEqual(len(reserve), 1)
+        self.assertEqual(summary["total_selected_tokens"], 0)
 
     # 24. Corrupted PDF
     def test_24_corrupted_pdf(self):

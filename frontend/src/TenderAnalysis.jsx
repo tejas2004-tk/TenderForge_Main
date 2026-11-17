@@ -1,6 +1,7 @@
-import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Component, useCallback, useEffect, useRef, useState } from "react";
 import { request } from "./auth.js";
 import { canStartFreshAnalysis, confirmFreshAnalysis, freshAnalysisRequest } from "./analysisFreshRun.js";
+import { formatRateLimitPause, normalizeProgress } from "./analysisProgress.js";
 
 const OVERVIEW_LABELS = {
   tender_title: "Tender title",
@@ -13,9 +14,42 @@ const OVERVIEW_LABELS = {
   important_conditions: "Important conditions",
 };
 
+function normalizeDiagnostic(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    operation: typeof value.operation === "string" ? value.operation : "",
+    batch_id: typeof value.batch_id === "string" ? value.batch_id : "",
+    batch_index: Number.isInteger(value.batch_index) ? value.batch_index : null,
+    exception_type: typeof value.exception_type === "string" ? value.exception_type : "",
+    exception_message: typeof value.exception_message === "string" ? value.exception_message : "",
+    error_code: value.error_code ?? null,
+    timestamp: typeof value.timestamp === "string" ? value.timestamp : null,
+  };
+}
+
+function normalizeProviderDiagnostic(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    operation: typeof value.operation === "string" ? value.operation : "",
+    endpoint: typeof value.endpoint === "string" ? value.endpoint : "",
+    status_code: Number.isInteger(value.status_code) ? value.status_code : null,
+    provider_code: typeof value.provider_code === "string" ? value.provider_code : "",
+    provider_type: typeof value.provider_type === "string" ? value.provider_type : "",
+    provider_message: typeof value.provider_message === "string" ? value.provider_message : "",
+    model: typeof value.model === "string" ? value.model : "",
+    estimated_input_tokens: Number(value.estimated_input_tokens) || 0,
+    max_output_tokens: Number(value.max_output_tokens) || 0,
+    temperature: Number(value.temperature),
+    response_mime_type: typeof value.response_mime_type === "string" ? value.response_mime_type : "",
+    retry_after_seconds: Number.isFinite(Number(value.retry_after_seconds))
+      ? Number(value.retry_after_seconds) : null,
+    retry_after_source: typeof value.retry_after_source === "string" ? value.retry_after_source : "",
+    timestamp: typeof value.timestamp === "string" ? value.timestamp : null,
+  };
+}
+
 export function normalizeAnalysis(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const progress = value.progress && typeof value.progress === "object" ? value.progress : {};
   const counts = value.requirement_counts && typeof value.requirement_counts === "object"
     ? value.requirement_counts : {};
   const coverage = value.coverage && typeof value.coverage === "object" ? value.coverage : null;
@@ -24,12 +58,12 @@ export function normalizeAnalysis(value) {
     status: typeof value.status === "string" ? value.status : "not_started",
     extraction_status: typeof value.extraction_status === "string" ? value.extraction_status : "not_processed",
     is_current_version: value.is_current_version !== false,
-    progress: {
-      total_batches: Number(progress.total_batches) || 0,
-      completed_batches: Number(progress.completed_batches) || 0,
-      pending_batches: Number(progress.pending_batches) || 0,
-      failed_batches: Number(progress.failed_batches) || 0,
-    },
+    progress: normalizeProgress(value.progress),
+    retry_after_seconds: Number.isFinite(Number(value.retry_after_seconds))
+      ? Number(value.retry_after_seconds) : null,
+    mongo_diagnostic: normalizeDiagnostic(value.mongo_diagnostic),
+    batch_diagnostic: normalizeDiagnostic(value.batch_diagnostic),
+    provider_diagnostic: normalizeProviderDiagnostic(value.provider_diagnostic),
     requirement_counts: {
       total: Number(counts.total) || 0,
       verified: Number(counts.verified) || 0,
@@ -48,6 +82,7 @@ export function normalizeAnalysis(value) {
           ? item.requirement_status : item.mandatory === true ? "mandatory" : item.mandatory === false ? "optional" : "unclear",
         applicability_condition: typeof item.applicability_condition === "string" ? item.applicability_condition : "",
         validation_status: typeof item.validation_status === "string" ? item.validation_status : "needs_review",
+        preliminary: item.preliminary === true,
         source_evidence: Array.isArray(item.source_evidence) ? item.source_evidence.filter((source) => source && typeof source === "object" && !Array.isArray(source)) : [],
         validation_reasons: Array.isArray(item.validation_reasons) ? item.validation_reasons.filter((reason) => typeof reason === "string") : [],
       })) : [],
@@ -111,15 +146,18 @@ function OverviewFields({ fields }) {
 }
 
 function Requirements({ requirements }) {
-  const groups = useMemo(() => {
+  const completed = requirements.filter((item) => !item.preliminary);
+  const preliminary = requirements.filter((item) => item.preliminary);
+  const renderGroups = (items) => {
+  const groups = (() => {
     const known = CATEGORIES.map((category) => ({
       category,
-      items: requirements.filter((item) => item.category === category),
+      items: items.filter((item) => item.category === category),
     })).filter((group) => group.items.length);
-    const other = requirements.filter((item) => !CATEGORIES.includes(item.category));
+    const other = items.filter((item) => !CATEGORIES.includes(item.category));
     if (other.length) known.push({ category: "Other", items: other });
     return known;
-  }, [requirements]);
+  })();
   if (!groups.length) return <div className="analysis-empty">No requirement findings have been saved yet.</div>;
   return <div className="analysis-groups">{groups.map(({ category, items }) => (
     <section className="analysis-category" key={category}>
@@ -147,6 +185,8 @@ function Requirements({ requirements }) {
       ))}</div>
     </section>
   ))}</div>;
+  };
+  return <>{renderGroups(completed)}{preliminary.length > 0 && <section className="analysis-preliminary"><h2>Preliminary findings</h2><p>These findings were preserved from incomplete responses and are not from completed batches.</p>{renderGroups(preliminary)}</section>}</>;
 }
 
 function TenderAnalysisPage({ tenderId, user, onBack }) {
@@ -197,7 +237,7 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
         steps += 1;
       }
       if (current.status === "paused_rate_limit") {
-        setNotice({ kind: "info", message: current.error_message || "Groq rate limited this analysis. Resume it later." });
+        setNotice({ kind: "info", message: current.error_message || "Gemini rate limited this analysis. Resume it later." });
       } else if (current.status === "failed") {
         setNotice({ kind: "error", message: current.error_message || "Analysis failed. You can resume it." });
       } else if (current.status === "needs_review") {
@@ -224,7 +264,8 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
 
   const progress = analysis?.progress || {};
   const canStart = analysis?.extraction_status === "completed";
-  const canResume = ["pending", "paused_rate_limit", "failed"].includes(analysis?.status);
+  const canResume = ["pending", "paused_rate_limit", "failed"].includes(analysis?.status)
+    || (analysis?.status === "needs_review" && progress.manual_review_batches > 0);
   const percentage = progress.total_batches ? Math.round(progress.completed_batches * 100 / progress.total_batches) : 0;
   const analysisIncomplete = analysis && progress.total_batches > 0 && (
     !["completed", "needs_review"].includes(analysis.status)
@@ -277,14 +318,29 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
           <section className="analysis-status-card">
             <div className="analysis-status-top"><div><span className="section-kicker">ANALYSIS STATUS</span><h2>{analysis.status.replaceAll("_", " ")}</h2></div><span className={`analysis-status-badge ${analysis.status}`}>{analysis.status.replaceAll("_", " ")}</span></div>
             {progress.total_batches > 0 && <><div className="analysis-progress-label"><span>{progress.completed_batches} of {progress.total_batches} batches</span><span>{percentage}%</span></div><div className="analysis-progress-track"><span style={{ width: `${percentage}%` }} /></div></>}
-            <div className="analysis-stats"><span><strong>{analysis.request_count || 0}</strong> Groq requests</span><span><strong>{analysis.estimated_input_tokens || 0}</strong> estimated input tokens</span><span><strong>{analysis.actual_input_tokens || 0}</strong> reported input tokens</span><span><strong>{analysis.actual_output_tokens || 0}</strong> reported output tokens</span><span><strong>{progress.failed_batches || 0}</strong> failed batches</span></div>
-            {analysis.unknown_usage_requests > 0 && <p className="analysis-usage-note">Groq returned no usage totals for {analysis.unknown_usage_requests} request attempts. Reported totals above include only calls that returned usage metadata.</p>}
+            <div className="analysis-stats"><span><strong>{analysis.request_count || 0}</strong> provider requests</span><span><strong>{analysis.estimated_input_tokens || 0}</strong> estimated input tokens</span><span><strong>{analysis.actual_input_tokens || 0}</strong> reported input tokens</span><span><strong>{analysis.actual_output_tokens || 0}</strong> reported output tokens</span><span><strong>{progress.processing_batches || 0}</strong> processing</span><span><strong>{progress.pending_batches || 0}</strong> pending</span><span><strong>{progress.split_batches || 0}</strong> split</span><span><strong>{progress.retrying_batches || 0}</strong> retrying</span><span><strong>{progress.failed_batches || 0}</strong> failed</span></div>
+            {analysis.unknown_usage_requests > 0 && <p className="analysis-usage-note">The provider returned no usage totals for {analysis.unknown_usage_requests} request attempts. Reported totals above include only calls that returned usage metadata.</p>}
             {analysis.processing_started_at && <p className="analysis-usage-note">Run started {new Date(analysis.processing_started_at).toLocaleString()}{analysis.processing_finished_at ? ` · finished ${new Date(analysis.processing_finished_at).toLocaleString()}` : ""}</p>}
           </section>
-          {analysis.status === "paused_rate_limit" && <div className="tender-notice info" role="status">Paused by {analysis.pause_reason === "daily_quota" ? "daily quota exhaustion" : "rate limit"}{analysis.pause_until ? ` until ${new Date(analysis.pause_until).toLocaleString()}` : ""}. Resume the current run after the cooldown.</div>}
+          {analysis.status === "paused_rate_limit" && <div className="tender-notice info" role="status">{analysis.pause_reason === "daily_quota" ? `Paused by daily quota exhaustion${analysis.pause_until ? ` until ${new Date(analysis.pause_until).toLocaleString()}` : ""}.` : formatRateLimitPause(analysis.pause_until, analysis.retry_after_seconds)} Resume the current run after the cooldown.</div>}
           {analysisIncomplete && <div className="tender-notice info" role="status">This analysis is incomplete. Findings below come only from completed batches and may not cover the entire tender.</div>}
+          {analysis && progress.total_batches > 0 && progress.completed_batches === 0 && <div className="tender-notice info" role="status">No batch has completed yet. Any preliminary findings are not a completed analysis.</div>}
           {analysis.coverage && <section className={`analysis-coverage ${analysis.coverage.complete ? "good" : "review"}`}><div><strong>Text coverage: {Math.round((analysis.coverage.ratio || 0) * 100)}%</strong><span>{analysis.coverage.selected_pages} of {analysis.coverage.pages_with_text} text-bearing pages sent for analysis ({analysis.coverage.total_pages} PDF pages total); {analysis.coverage.unexamined_pages} text-bearing pages not sent.</span></div>{!analysis.coverage.complete && <p>Coverage is partial. Treat findings as incomplete and review the listed unexamined pages.</p>}</section>}
-          {analysis.error_message && <div className="analysis-error-detail">{analysis.error_message}</div>}
+          {(analysis.error_message || analysis.mongo_diagnostic || analysis.batch_diagnostic || analysis.provider_diagnostic) && <div className="analysis-error-detail">
+            <div>{analysis.error_message || "Analysis failed."}</div>
+            {(analysis.mongo_diagnostic || analysis.batch_diagnostic) && <div>
+              {analysis.mongo_diagnostic && <div>Database operation: {analysis.mongo_diagnostic.operation} · {analysis.mongo_diagnostic.exception_type}: {analysis.mongo_diagnostic.exception_message}</div>}
+              {!analysis.mongo_diagnostic && analysis.batch_diagnostic && <div>Batch operation: {analysis.batch_diagnostic.operation} · {analysis.batch_diagnostic.exception_type}: {analysis.batch_diagnostic.exception_message}</div>}
+            </div>}
+            {analysis.provider_diagnostic && <div>
+              Provider response: HTTP {analysis.provider_diagnostic.status_code || "unknown"}
+              {analysis.provider_diagnostic.provider_code ? ` · ${analysis.provider_diagnostic.provider_code}` : ""}
+              {analysis.provider_diagnostic.provider_message ? ` · ${analysis.provider_diagnostic.provider_message}` : ""}
+              {analysis.provider_diagnostic.retry_after_seconds !== null
+                ? ` · retry after ${analysis.provider_diagnostic.retry_after_seconds}s`
+                : ""}
+            </div>}
+          </div>}
           <OverviewFields fields={analysis.overview_fields} />
           {analysis.overview && !Object.keys(analysis.overview_fields || {}).length && <section className="analysis-overview"><span className="section-kicker">TENDER OVERVIEW</span><p>{analysis.overview}</p></section>}
           {analysis.coverage?.unexamined_page_numbers?.length > 0 && <details className="analysis-unexamined"><summary>Unexamined page numbers</summary><p>{analysis.coverage.unexamined_page_numbers.join(", ")}{analysis.coverage.unexamined_pages > analysis.coverage.unexamined_page_numbers.length ? " …" : ""}</p></details>}

@@ -16,6 +16,10 @@ export async function request(path, options = {}) {
     throw new Error("Cannot reach the backend. Check that Flask is running.");
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.message || `Request failed (${response.status}).`);
+  if (!response.ok) {
+    const error = new Error(data.message || `Request failed (${response.status}).`);
+    error.data = data;
+    throw error;
+  }
   return data;
 }

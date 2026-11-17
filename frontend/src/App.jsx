@@ -5,10 +5,16 @@ import CompanyProfile from "./CompanyProfile.jsx";
 import MyTenders from "./MyTenders.jsx";
 import TenderAnalysis from "./TenderAnalysis.jsx";
 import { request } from "./auth.js";
+import {
+  connectionStatusDetail,
+  connectionStatusLabel,
+  formatGeminiConnectionError,
+  formatGeminiConnectionSuccess,
+} from "./connectionStatus.js";
 
 function StatusCard({ icon, label, status, detail }) {
   const state = status === "connected" || status === "online" ? "good" : status === "checking" ? "checking" : "bad";
-  const text = status === "online" ? "Online" : status === "checking" ? "Checking" : status === "connected" ? "Connected" : "Unavailable";
+  const text = connectionStatusLabel(status);
   return (
     <article className="status-card">
       <div className="status-top"><span className="status-icon">{icon}</span><span className={`pill ${state}`}><i />{text}</span></div>
@@ -20,7 +26,7 @@ function StatusCard({ icon, label, status, detail }) {
 function Dashboard({ user, onLogout, onOpenProfile, onOpenTenders }) {
   const [backend, setBackend] = useState("checking");
   const [database, setDatabase] = useState("checking");
-  const [groq, setGroq] = useState("idle");
+  const [gemini, setGemini] = useState("idle");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
 
@@ -41,13 +47,15 @@ function Dashboard({ user, onLogout, onOpenProfile, onOpenTenders }) {
 
   useEffect(() => { checkConnections(); }, [checkConnections]);
 
-  async function runGroqTest() {
-    setLoading(true); setGroq("checking"); setResult(null);
+  async function runGeminiTest() {
+    setLoading(true); setGemini("checking"); setResult(null);
     try {
-      const data = await request("/test-groq");
-      setGroq("connected"); setResult({ kind: "success", message: data.message });
+      const data = await request("/test-gemini");
+      setGemini("connected"); setResult({ kind: "success", message: formatGeminiConnectionSuccess(data.model, data.message) });
     } catch (error) {
-      setGroq("offline"); setResult({ kind: "error", message: error.message });
+      setGemini("offline");
+      const model = error.data?.model;
+      setResult({ kind: "error", message: formatGeminiConnectionError(error.message, model) });
     } finally {
       setLoading(false);
     }
@@ -69,18 +77,18 @@ function Dashboard({ user, onLogout, onOpenProfile, onOpenTenders }) {
 
       <section className="section-heading"><div><span className="section-kicker">SYSTEM OVERVIEW</span><h2>Connections</h2></div><span className="updated">LIVE STATUS</span></section>
       <section className="status-grid" aria-label="Service connection status">
-        <StatusCard icon="⌘" label="Backend API" status={backend} detail={backend === "online" ? "Flask service is responding" : backend === "checking" ? "Checking Flask service…" : "Flask service is unreachable"} />
-        <StatusCard icon="◈" label="MongoDB Atlas" status={database} detail={database === "connected" ? "Database connection is healthy" : database === "checking" ? "Checking database…" : "Waiting for a database connection"} />
-        <StatusCard icon="✳" label="Groq" status={groq === "idle" ? "offline" : groq} detail={groq === "connected" ? "AI service is responding" : groq === "checking" ? "Checking Groq…" : "Run a test to check the connection"} />
+        <StatusCard icon="⌘" label="Backend API" status={backend} detail={connectionStatusDetail(backend, "Flask")} />
+        <StatusCard icon="◈" label="MongoDB Atlas" status={database} detail={database === "connected" ? "Database connection is healthy" : database === "checking" ? "Checking database…" : database === "offline" ? "Database connection failed" : "Not tested"} />
+        <StatusCard icon="✳" label="Gemini" status={gemini} detail={connectionStatusDetail(gemini, "Gemini")} />
       </section>
 
       <section className="test-panel">
-        <div className="test-copy"><span className="section-kicker">QUICK CHECK</span><h2>Test your AI connection</h2><p>Send a short test prompt to Groq through your secure backend.</p></div>
-        <button className="primary-button" onClick={runGroqTest} disabled={loading || backend !== "online"}>{loading ? <><span className="spinner" />Testing…</> : <>Test Groq <span>↗</span></>}</button>
+        <div className="test-copy"><span className="section-kicker">QUICK CHECK</span><h2>Test your AI connection</h2><p>Send a short test prompt to Gemini through your secure backend.</p></div>
+        <button className="primary-button" onClick={runGeminiTest} disabled={loading || backend !== "online"}>{loading ? <><span className="spinner" />Testing…</> : <>Test Gemini <span>↗</span></>}</button>
       </section>
 
       <section className="response-section" aria-live="polite"><div className="response-heading"><div><span className="section-kicker">TEST OUTPUT</span><h2>Response</h2></div>{result && <span className={`result-label ${result.kind}`}>{result.kind === "success" ? "SUCCESS" : "NEEDS ATTENTION"}</span>}</div>
-        <div className={`response-box ${result ? result.kind : "empty"}`}>{result ? <><span className="response-indicator">{result.kind === "success" ? "↳" : "!"}</span><p>{result.message}</p></> : <><span className="empty-icon">↳</span><p>Your Groq test response will appear here.</p></>}</div>
+        <div className={`response-box ${result ? result.kind : "empty"}`}>{result ? <><span className="response-indicator">{result.kind === "success" ? "↳" : "!"}</span><p>{result.message}</p></> : <><span className="empty-icon">↳</span><p>Your Gemini test response will appear here.</p></>}</div>
       </section>
       <footer><span>© 2026 TenderForge</span><span>Built for clarity. Ready to forge.</span></footer>
     </main>
