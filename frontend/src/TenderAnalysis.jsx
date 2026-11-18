@@ -1,7 +1,8 @@
 import { Component, useCallback, useEffect, useRef, useState } from "react";
 import { request } from "./auth.js";
 import { canStartFreshAnalysis, confirmFreshAnalysis, freshAnalysisRequest } from "./analysisFreshRun.js";
-import { acceptAnalysisUpdate, formatRateLimitPause, normalizeProgress } from "./analysisProgress.js";
+import { acceptAnalysisUpdate, normalizeProgress } from "./analysisProgress.js";
+import { deriveDisplayRequirements } from "./analysisQuality.js";
 
 const OVERVIEW_LABELS = {
   tender_title: "Tender title",
@@ -53,6 +54,28 @@ export function normalizeAnalysis(value) {
   const counts = value.requirement_counts && typeof value.requirement_counts === "object"
     ? value.requirement_counts : {};
   const coverage = value.coverage && typeof value.coverage === "object" ? value.coverage : null;
+  const requirements = Array.isArray(value.requirements) ? value.requirements
+    .filter((item) => item && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      ...item,
+      category: typeof item.category === "string" ? item.category : "Other Mandatory Bidder Conditions",
+      requirement_title: typeof item.requirement_title === "string" ? item.requirement_title : "",
+      description: typeof item.description === "string" ? item.description : "",
+      requirement_value: typeof item.requirement_value === "string" ? item.requirement_value : "",
+      requirement_status: ["mandatory", "conditional", "optional", "informational", "unclear"].includes(item.requirement_status)
+        ? item.requirement_status : item.mandatory === true ? "mandatory" : item.mandatory === false ? "optional" : "unclear",
+      applicability_condition: typeof item.applicability_condition === "string" ? item.applicability_condition : "",
+      validation_status: typeof item.validation_status === "string" ? item.validation_status : "needs_review",
+      preliminary: item.preliminary === true,
+      source_evidence: Array.isArray(item.source_evidence) ? item.source_evidence.filter((source) => source && typeof source === "object" && !Array.isArray(source)) : [],
+      validation_reasons: Array.isArray(item.validation_reasons) ? item.validation_reasons.filter((reason) => typeof reason === "string") : [],
+    })) : [];
+  const displayRequirements = deriveDisplayRequirements(requirements);
+  const displayCounts = {
+    total: displayRequirements.length,
+    verified: displayRequirements.filter((item) => item.validation_status === "verified").length,
+    needs_review: displayRequirements.filter((item) => item.validation_status !== "verified").length,
+  };
   return {
     ...value,
     status: typeof value.status === "string" ? value.status : "not_started",
@@ -65,27 +88,12 @@ export function normalizeAnalysis(value) {
     batch_diagnostic: normalizeDiagnostic(value.batch_diagnostic),
     provider_diagnostic: normalizeProviderDiagnostic(value.provider_diagnostic),
     requirement_counts: {
-      total: Number(counts.total) || 0,
-      verified: Number(counts.verified) || 0,
-      needs_review: Number(counts.needs_review) || 0,
+      total: displayCounts.total,
+      verified: displayCounts.verified,
+      needs_review: displayCounts.needs_review,
       eligible_for_phase7: Number(counts.eligible_for_phase7) || 0,
     },
-    requirements: Array.isArray(value.requirements) ? value.requirements
-      .filter((item) => item && typeof item === "object" && !Array.isArray(item))
-      .map((item) => ({
-        ...item,
-        category: typeof item.category === "string" ? item.category : "Other Mandatory Bidder Conditions",
-        requirement_title: typeof item.requirement_title === "string" ? item.requirement_title : "Untitled requirement",
-        description: typeof item.description === "string" ? item.description : "",
-        requirement_value: typeof item.requirement_value === "string" ? item.requirement_value : "",
-        requirement_status: ["mandatory", "conditional", "optional", "informational", "unclear"].includes(item.requirement_status)
-          ? item.requirement_status : item.mandatory === true ? "mandatory" : item.mandatory === false ? "optional" : "unclear",
-        applicability_condition: typeof item.applicability_condition === "string" ? item.applicability_condition : "",
-        validation_status: typeof item.validation_status === "string" ? item.validation_status : "needs_review",
-        preliminary: item.preliminary === true,
-        source_evidence: Array.isArray(item.source_evidence) ? item.source_evidence.filter((source) => source && typeof source === "object" && !Array.isArray(source)) : [],
-        validation_reasons: Array.isArray(item.validation_reasons) ? item.validation_reasons.filter((reason) => typeof reason === "string") : [],
-      })) : [],
+    requirements: displayRequirements,
     coverage: coverage ? {
       ...coverage,
       ratio: Number(coverage.ratio) || 0,
@@ -146,15 +154,45 @@ function OverviewFields({ fields }) {
 }
 
 function Requirements({ requirements }) {
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [importanceFilter, setImportanceFilter] = useState("all");
+  const [sort, setSort] = useState("category");
   const completed = requirements.filter((item) => !item.preliminary);
   const preliminary = requirements.filter((item) => item.preliminary);
+  const matches = (item) => {
+    const query = search.trim().toLocaleLowerCase();
+    const searchable = [
+      item.requirement_title,
+      item.display_description,
+      item.description,
+      item.requirement_value,
+      item.applicability_condition,
+      item.category,
+      ...(item.source_evidence || []).map((source) => source.evidence_text),
+    ].join(" ").toLocaleLowerCase();
+    if (query && !searchable.includes(query)) return false;
+    if (statusFilter !== "all" && item.validation_status !== statusFilter) return false;
+    if (importanceFilter === "mandatory" && item.requirement_status !== "mandatory") return false;
+    if (importanceFilter === "other" && item.requirement_status === "mandatory") return false;
+    return true;
+  };
+  const filteredCompleted = completed.filter(matches);
+  const filteredPreliminary = preliminary.filter(matches);
+  const filteredCount = filteredCompleted.length + filteredPreliminary.length;
   const renderGroups = (items) => {
+  const sortedItems = [...items].sort((a, b) => {
+    if (sort === "title") return String(a.requirement_title || "").localeCompare(String(b.requirement_title || ""));
+    if (sort === "page") return Number(a.source_page || 999999) - Number(b.source_page || 999999);
+    if (sort === "review") return (a.validation_status === "needs_review" ? 0 : 1) - (b.validation_status === "needs_review" ? 0 : 1);
+    return String(a.category || "").localeCompare(String(b.category || ""));
+  });
   const groups = (() => {
     const known = CATEGORIES.map((category) => ({
       category,
-      items: items.filter((item) => item.category === category),
+      items: sortedItems.filter((item) => item.category === category),
     })).filter((group) => group.items.length);
-    const other = items.filter((item) => !CATEGORIES.includes(item.category));
+    const other = sortedItems.filter((item) => !CATEGORIES.includes(item.category));
     if (other.length) known.push({ category: "Other", items: other });
     return known;
   })();
@@ -165,28 +203,42 @@ function Requirements({ requirements }) {
       <div className="analysis-requirements">{items.map((item, index) => (
         <article className="analysis-requirement" key={`${category}-${item.source_page}-${index}`}>
           <div className="analysis-requirement-top">
-            <h3>{item.requirement_title}</h3>
-            <span className={`verification-pill ${item.validation_status}`}>
-              {item.validation_status === "verified" ? "Evidence verified" : "Needs review"}
-            </span>
+            <div className="analysis-requirement-title"><h3>{item.requirement_title || "Tender condition"}</h3><span className={`importance-pill ${item.requirement_status === "mandatory" ? "mandatory" : ""}`}>{item.requirement_status === "mandatory" ? "Mandatory requirement" : item.requirement_status === "conditional" ? "Conditional requirement" : item.requirement_status === "optional" ? "Optional requirement" : "Requirement status: unclear"}</span></div>
+            <span className={`verification-pill ${item.validation_status}`}>{item.validation_status === "verified" ? "Evidence supported" : "Review required"}</span>
           </div>
-          <p>{item.description}</p>
+          {(item.display_description || item.description) && <p>{item.display_description || item.description}</p>}
           <dl className="analysis-facts">
-            <div><dt>Extracted value</dt><dd>{item.requirement_value || "Not specified"}</dd></div>
-            <div><dt>Requirement status</dt><dd>{item.requirement_status}</dd></div>
+            {item.requirement_value && <div><dt>Extracted value</dt><dd>{item.requirement_value}</dd></div>}
+            <div><dt>Compliance status</dt><dd>{item.requirement_status === "unclear" ? "Review required" : item.requirement_status}</dd></div>
             {item.requirement_status === "conditional" && item.applicability_condition && <div><dt>Applies when</dt><dd>{item.applicability_condition}</dd></div>}
-            <div><dt>PDF page</dt><dd>{item.source_page ? item.source_page : "Unverified"}</dd></div>
+            {item.source_page && <div><dt>Source page</dt><dd>{item.source_page}</dd></div>}
           </dl>
-          {(item.source_evidence?.length ? item.source_evidence : item.evidence_text ? [{ source_page: item.source_page, evidence_text: item.evidence_text }] : []).map((source, sourceIndex) => (
-            <blockquote key={`${source.source_page}-${sourceIndex}`}><span>Source evidence · page {source.source_page || "unverified"}</span>{source.evidence_text || "No evidence text was provided."}</blockquote>
-          ))}
+          {item.source_evidence?.length
+            ? item.source_evidence.map((source, sourceIndex) => (
+                <blockquote key={`${source.source_page}-${sourceIndex}`}><span>Evidence · {source.source_page ? `Source page ${source.source_page}` : "Source page not stated"}</span>{source.evidence_text}</blockquote>
+              ))
+            : <p className="analysis-no-evidence">No supporting evidence is cited. Review against the tender document.</p>}
           {item.validation_reasons?.length > 0 && <ul className="analysis-review-reasons">{item.validation_reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
+          {item.display_merged_count > 1 && <p className="analysis-merged-note">Combined from {item.display_merged_count} matching entries while preserving all cited evidence.</p>}
         </article>
       ))}</div>
     </section>
   ))}</div>;
   };
-  return <>{renderGroups(completed)}{preliminary.length > 0 && <section className="analysis-preliminary"><h2>Preliminary findings</h2><p>These findings were preserved from incomplete responses and are not from completed batches.</p>{renderGroups(preliminary)}</section>}</>;
+  return (
+    <div className="analysis-findings">
+      <div className="analysis-filters" aria-label="Requirement filters">
+        <label className="analysis-search"><span>Search requirements</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search requirement, value, or evidence" /></label>
+        <label><span>Compliance status</span><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">All findings</option><option value="verified">Evidence supported</option><option value="needs_review">Review required</option></select></label>
+        <label><span>Importance</span><select value={importanceFilter} onChange={(event) => setImportanceFilter(event.target.value)}><option value="all">All requirements</option><option value="mandatory">Mandatory</option><option value="other">Conditional or other</option></select></label>
+        <label><span>Sort by</span><select value={sort} onChange={(event) => setSort(event.target.value)}><option value="category">Category</option><option value="title">Requirement title</option><option value="page">Source page</option><option value="review">Review needed first</option></select></label>
+      </div>
+      <div className="analysis-filter-summary">{filteredCount} of {requirements.length} requirements shown</div>
+      {renderGroups(filteredCompleted)}
+      {filteredPreliminary.length > 0 && <section className="analysis-preliminary"><h2>Preliminary findings</h2><p>These findings came from an incomplete analysis section and require review.</p>{renderGroups(filteredPreliminary)}</section>}
+      {filteredCount === 0 && <div className="analysis-empty">No requirements match these filters.</div>}
+    </div>
+  );
 }
 
 function TenderAnalysisPage({ tenderId, user, onBack }) {
@@ -256,7 +308,7 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
         steps += 1;
       }
       if (current.status === "paused_rate_limit") {
-        setNotice({ kind: "info", message: current.error_message || "Gemini rate limited this analysis. Resume it later." });
+        setNotice({ kind: "info", message: "Analysis capacity is temporarily unavailable. Resume it later." });
       } else if (current.status === "failed") {
         setNotice({ kind: "error", message: current.error_message || "Analysis failed. You can resume it." });
       } else if (current.status === "needs_review") {
@@ -294,10 +346,10 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
   const prerequisite = analysis?.extraction_status === "needs_ocr"
     ? { title: "This PDF needs OCR", message: "This tender appears to be scanned. Text-based analysis requires searchable PDF text; OCR is not available in this phase." }
     : analysis?.extraction_status === "failed"
-      ? { title: "Retry PDF processing", message: "Phase 5 PDF text processing failed. Return to My Tenders and retry Process PDF before starting analysis." }
+      ? { title: "Document text processing needs attention", message: "The PDF text could not be prepared. Return to My Tenders and process the document again before starting analysis." }
       : analysis?.extraction_status === "processing"
-        ? { title: "PDF processing is underway", message: "Wait for Phase 5 text processing to finish, then return here to analyse the tender." }
-        : { title: "Process the PDF first", message: "Phase 5 text extraction must finish before Agent 1 can analyse this tender. Return to My Tenders and choose Process PDF." };
+        ? { title: "PDF processing is underway", message: "Wait for document text processing to finish, then return here to analyse the tender." }
+        : { title: "Process the PDF first", message: "Document text preparation must finish before analysis can begin. Return to My Tenders and choose Process PDF." };
 
   return (
     <main className="analysis-page">
@@ -310,26 +362,26 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
 
       <section className="analysis-hero">
         <button className="profile-back" onClick={onBack}>← <span>My Tenders</span></button>
-        <div className="eyebrow"><span /> AGENT 1 · TENDER ANALYSIS</div>
-        <div className="analysis-title-row"><div><h1>Tender analysis</h1><p>Evidence-based bidder requirements from your saved PDF text.</p>{analysis && <p className="analysis-version">Analysis run {analysis.analysis_version || "unknown"} · Agent 1 code {analysis.analysis_logic_version || "unknown"} · Prompt {analysis.prompt_version || "unknown"}</p>}</div>
+        <div className="eyebrow"><span /> TENDER COMPLIANCE REVIEW</div>
+        <div className="analysis-title-row"><div><h1>Tender analysis</h1><p>Clear tender conditions and supporting document evidence.</p></div>
           <div className="analysis-actions">
           {!loading && analysis && (analysis.is_current_version === false
-            ? <button className="primary-button" disabled={!canStart || working} onClick={() => runAnalysis(false)}>{working ? <><span className="spinner" />Startingâ€¦</> : "Run updated analysis"}</button>
+            ? <button className="primary-button" disabled={!canStart || working} onClick={() => runAnalysis(false)}>{working ? <><span className="spinner" />Starting…</> : "Update analysis"}</button>
             : analysis.status === "not_started"
             ? <button className="primary-button" disabled={!canStart || working} onClick={() => runAnalysis(false)}>{working ? <><span className="spinner" />Starting…</> : "Analyse Tender"}</button>
             : canResume
-              ? <button className="primary-button" disabled={working} onClick={() => runAnalysis(true)}>{working ? <><span className="spinner" />Resuming…</> : "Resume analysis"}</button>
+              ? <button className="primary-button" disabled={working} onClick={() => runAnalysis(true)}>{working ? <><span className="spinner" />Continuing…</> : "Continue analysis"}</button>
               : analysis.status === "processing"
                 ? analysis.in_progress
                   ? <button className="secondary-button" disabled={working} onClick={load}>{working ? "Updating…" : "Refresh progress"}</button>
                   : <button className="primary-button" disabled={working} onClick={() => runAnalysis(true)}>{working ? <><span className="spinner" />Continuing…</> : "Continue analysis"}</button>
                 : <button className="secondary-button" disabled={working} onClick={load}>Refresh</button>)}
-            {!loading && analysis && <button className="secondary-button" disabled={!canStartFreshAnalysis(analysis, working)} onClick={startFreshAnalysis}>Re-analyse with latest code</button>}
+            {!loading && analysis && <button className="secondary-button" disabled={!canStartFreshAnalysis(analysis, working)} onClick={startFreshAnalysis}>Run a fresh analysis</button>}
           </div>
         </div>
       </section>
 
-      {!loading && analysis?.is_current_version === false && <div className="tender-notice info" role="status">Showing saved analysis version {analysis.analysis_version}. A newer analysis version is available; run it to refresh these findings.</div>}
+      {!loading && analysis?.is_current_version === false && <div className="tender-notice info" role="status">This is a saved analysis. Newer analysis settings are available; updating it is optional.</div>}
       {notice && <div className={`tender-notice ${notice.kind}`} role="status">{notice.message}</div>}
       {loading ? <div className="tender-loading"><span className="spinner" />Loading tender analysis…</div> : !analysis ? null : !canStart && analysis.status === "not_started" ? (
         <section className="analysis-prerequisite"><span className="analysis-prerequisite-icon">i</span><div><h2>{prerequisite.title}</h2><p>{prerequisite.message}</p></div></section>
@@ -337,23 +389,23 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
         <>
           <section className="analysis-status-card">
             <div className="analysis-status-top"><div><span className="section-kicker">ANALYSIS STATUS</span><h2>{statusLabel}</h2></div><span className={`analysis-status-badge ${analysis.status}`}>{statusLabel}</span></div>
-            {progress.total_batches > 0 && <><div className="analysis-progress-label"><span>{progress.workflow_completed_batches} complete · {progress.processing_batches} processing · {progress.pending_batches + progress.retrying_batches + progress.failed_batches + progress.manual_review_batches} remaining{progress.retrying_batches ? ` · ${progress.retrying_batches} retrying` : ""}</span><span>{workflowPercentage}%</span></div><div className="analysis-progress-track"><span style={{ width: `${workflowPercentage}%` }} /></div><p className="analysis-usage-note">AI coverage: {Math.round((analysis.coverage?.text_coverage_ratio || 0) * 100)}% of extracted readable text analyzed.</p></>}
+            {progress.total_batches > 0 && <><div className="analysis-progress-label"><span>{progress.workflow_completed_batches} sections complete · {progress.processing_batches} in progress · {progress.pending_batches + progress.retrying_batches + progress.failed_batches + progress.manual_review_batches} remaining</span><span>{workflowPercentage}%</span></div><div className="analysis-progress-track"><span style={{ width: `${workflowPercentage}%` }} /></div><p className="analysis-usage-note">Document coverage: {Math.round((analysis.coverage?.text_coverage_ratio || 0) * 100)}% of extracted readable text reviewed.</p></>}
             {analysis.processing_started_at && <p className="analysis-usage-note">Run started {new Date(analysis.processing_started_at).toLocaleString()}{analysis.processing_finished_at ? ` · finished ${new Date(analysis.processing_finished_at).toLocaleString()}` : ""}</p>}
           </section>
-          {analysis.status === "paused_rate_limit" && <div className="tender-notice info" role="status">{analysis.pause_reason === "daily_quota" ? `Paused by daily quota exhaustion${analysis.pause_until ? ` until ${new Date(analysis.pause_until).toLocaleString()}` : ""}.` : formatRateLimitPause(analysis.pause_until, analysis.retry_after_seconds)} Resume the current run after the cooldown.</div>}
-          {analysisIncomplete && <div className="tender-notice info" role="status">This analysis is incomplete. Findings below come only from completed batches and may not cover the entire tender.</div>}
-          {analysis && progress.total_batches > 0 && progress.completed_batches === 0 && <div className="tender-notice info" role="status">No batch has completed yet. Any preliminary findings are not a completed analysis.</div>}
-          {analysis.coverage && <section className={`analysis-coverage ${analysis.coverage.complete ? "good" : "review"}`}><div><strong>AI coverage: {Math.round((analysis.coverage.text_coverage_ratio || 0) * 100)}%</strong><span>{analysis.coverage.selected_pages} of {analysis.coverage.pages_with_text} text-bearing pages fully analyzed ({analysis.coverage.total_pages} PDF pages total); {analysis.coverage.unexamined_pages} text-bearing pages remain incomplete.</span></div>{!analysis.coverage.complete && <p>Coverage is partial. Treat findings as incomplete and review the listed unexamined pages.</p>}</section>}
-          {(analysis.error_message || analysis.mongo_diagnostic || analysis.batch_diagnostic || analysis.provider_diagnostic) && <div className="analysis-error-detail" role="status">{analysis.status === "failed" ? "Analysis needs attention. You can resume processing." : analysis.status === "paused_rate_limit" ? "Analysis is paused and can be resumed when provider capacity is available." : analysis.status === "completed_with_warnings" || analysis.status === "needs_review" ? "Analysis is ready with some items or source text to review." : "Analysis is processing."}</div>}
+          {analysis.status === "paused_rate_limit" && <div className="tender-notice info" role="status">Analysis is temporarily paused. Continue it when processing capacity is available.</div>}
+          {analysisIncomplete && <div className="tender-notice info" role="status">This analysis is incomplete. Findings below come only from completed sections and may not cover the entire tender.</div>}
+          {analysis && progress.total_batches > 0 && progress.completed_batches === 0 && <div className="tender-notice info" role="status">No analysis section has completed yet. Any preliminary findings are not a completed analysis.</div>}
+          {analysis.coverage && <section className={`analysis-coverage ${analysis.coverage.complete ? "good" : "review"}`}><div><strong>Document coverage: {Math.round((analysis.coverage.text_coverage_ratio || 0) * 100)}%</strong><span>{analysis.coverage.selected_pages} of {analysis.coverage.pages_with_text} text-bearing pages reviewed ({analysis.coverage.total_pages} PDF pages total); {analysis.coverage.unexamined_pages} text-bearing pages remain to be reviewed.</span></div>{!analysis.coverage.complete && <p>Coverage is partial. Treat findings as incomplete and review the listed unreviewed pages.</p>}</section>}
+          {(analysis.error_message || analysis.mongo_diagnostic || analysis.batch_diagnostic || analysis.provider_diagnostic) && <div className="analysis-error-detail" role="status">{analysis.status === "failed" ? "Analysis needs attention. You can continue when ready." : analysis.status === "paused_rate_limit" ? "Analysis is paused and can continue when processing capacity is available." : analysis.status === "completed_with_warnings" || analysis.status === "needs_review" ? "Analysis is ready with some items or source text to review." : "Analysis is processing."}</div>}
           <OverviewFields fields={analysis.overview_fields} />
           {analysis.overview && !Object.keys(analysis.overview_fields || {}).length && <section className="analysis-overview"><span className="section-kicker">TENDER OVERVIEW</span><p>{analysis.overview}</p></section>}
-          {analysis.coverage?.unexamined_page_numbers?.length > 0 && <details className="analysis-unexamined"><summary>Unexamined page numbers</summary><p>{analysis.coverage.unexamined_page_numbers.join(", ")}{analysis.coverage.unexamined_pages > analysis.coverage.unexamined_page_numbers.length ? " …" : ""}</p></details>}
+          {analysis.coverage?.unexamined_page_numbers?.length > 0 && <details className="analysis-unexamined"><summary>Pages not yet reviewed</summary><p>{analysis.coverage.unexamined_page_numbers.join(", ")}{analysis.coverage.unexamined_pages > analysis.coverage.unexamined_page_numbers.length ? " …" : ""}</p></details>}
           <section className="analysis-results-heading"><div><span className="section-kicker">STRUCTURED FINDINGS</span><h2>Requirements</h2></div><div className="analysis-counts"><span>{analysis.requirement_counts.verified} verified</span><span>{analysis.requirement_counts.needs_review} to review</span></div></section>
           <Requirements requirements={analysis.requirements || []} />
-          <p className="analysis-phase7-note">Only evidence-verified requirement findings are eligible for a future Phase 7 workflow. Overview summaries, uncertain findings, and conflicting findings are not company input cards.</p>
+          <p className="analysis-phase7-note">Findings marked as review required should be checked against the supporting document before use in a compliance decision.</p>
         </>
       )}
-      <footer className="tenders-footer"><span>© 2026 TenderForge</span><span>Agent 1 · Tender Analysis</span></footer>
+      <footer className="tenders-footer"><span>© 2026 TenderForge</span><span>Tender compliance review</span></footer>
     </main>
   );
 }
