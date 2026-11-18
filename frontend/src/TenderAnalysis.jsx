@@ -1,7 +1,7 @@
 import { Component, useCallback, useEffect, useRef, useState } from "react";
 import { request } from "./auth.js";
 import { canStartFreshAnalysis, confirmFreshAnalysis, freshAnalysisRequest } from "./analysisFreshRun.js";
-import { formatRateLimitPause, normalizeProgress } from "./analysisProgress.js";
+import { acceptAnalysisUpdate, formatRateLimitPause, normalizeProgress } from "./analysisProgress.js";
 
 const OVERVIEW_LABELS = {
   tender_title: "Tender title",
@@ -202,7 +202,7 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
       const result = await request(`/tenders/${tenderId}/analysis`);
       const normalized = normalizeAnalysis(result?.analysis);
       if (!normalized) throw new Error("The backend returned an invalid analysis response. Refresh the page or return to My Tenders.");
-      setAnalysis(normalized);
+      setAnalysis((previous) => acceptAnalysisUpdate(previous, normalized));
       setNotice(null);
     } catch (error) {
       setNotice({ kind: "error", message: error.message });
@@ -212,6 +212,25 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
   }, [tenderId]);
 
   useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    if (!working) return undefined;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const result = await request(`/tenders/${tenderId}/analysis`);
+        const normalized = normalizeAnalysis(result?.analysis);
+        if (!stopped && normalized) {
+          setAnalysis((previous) => acceptAnalysisUpdate(previous, normalized));
+        }
+      } catch {
+        // The active analysis request remains authoritative; the next poll can recover.
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 1800);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [working, tenderId]);
 
   async function runAnalysis(resume = false, fresh = false) {
     if (runGuard.current) return;
@@ -227,13 +246,13 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
         : `/tenders/${tenderId}/analysis`), freshRequest?.options || { method: "POST" });
       let current = normalizeAnalysis(result?.analysis);
       if (!current) throw new Error("The backend returned an invalid analysis response. Please try again.");
-      setAnalysis(current);
+      setAnalysis((previous) => acceptAnalysisUpdate(previous, current));
       let steps = 0;
       while (current.status === "processing" && !current.in_progress && steps < 500) {
         result = await request(`/tenders/${tenderId}/analysis/resume`, { method: "POST" });
         current = normalizeAnalysis(result?.analysis);
         if (!current) throw new Error("The backend returned an invalid analysis response. Please try again.");
-        setAnalysis(current);
+        setAnalysis((previous) => acceptAnalysisUpdate(previous, current));
         steps += 1;
       }
       if (current.status === "paused_rate_limit") {
@@ -266,11 +285,12 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
   const canStart = analysis?.extraction_status === "completed";
   const canResume = ["pending", "paused_rate_limit", "failed"].includes(analysis?.status)
     || (analysis?.status === "needs_review" && progress.manual_review_batches > 0);
-  const percentage = progress.total_batches ? Math.round(progress.completed_batches * 100 / progress.total_batches) : 0;
-  const analysisIncomplete = analysis && progress.total_batches > 0 && (
-    !["completed", "needs_review"].includes(analysis.status)
-    || progress.completed_batches < progress.total_batches
-  );
+  const workflowPercentage = progress.total_batches
+    ? Math.round(progress.workflow_completed_batches * 100 / progress.total_batches) : 0;
+  const analysisIncomplete = analysis && progress.total_batches > 0 && workflowPercentage < 100;
+  const statusLabel = analysis?.status === "completed" || analysis?.status === "completed_with_warnings" || analysis?.status === "needs_review"
+    ? "Analysis ready" : analysis?.status === "processing" || analysis?.status === "pending"
+      ? "Processing requirements" : "Analyzing tender";
   const prerequisite = analysis?.extraction_status === "needs_ocr"
     ? { title: "This PDF needs OCR", message: "This tender appears to be scanned. Text-based analysis requires searchable PDF text; OCR is not available in this phase." }
     : analysis?.extraction_status === "failed"
@@ -316,31 +336,15 @@ function TenderAnalysisPage({ tenderId, user, onBack }) {
       ) : (
         <>
           <section className="analysis-status-card">
-            <div className="analysis-status-top"><div><span className="section-kicker">ANALYSIS STATUS</span><h2>{analysis.status.replaceAll("_", " ")}</h2></div><span className={`analysis-status-badge ${analysis.status}`}>{analysis.status.replaceAll("_", " ")}</span></div>
-            {progress.total_batches > 0 && <><div className="analysis-progress-label"><span>{progress.completed_batches} of {progress.total_batches} batches</span><span>{percentage}%</span></div><div className="analysis-progress-track"><span style={{ width: `${percentage}%` }} /></div></>}
-            <div className="analysis-stats"><span><strong>{analysis.request_count || 0}</strong> provider requests</span><span><strong>{analysis.estimated_input_tokens || 0}</strong> estimated input tokens</span><span><strong>{analysis.actual_input_tokens || 0}</strong> reported input tokens</span><span><strong>{analysis.actual_output_tokens || 0}</strong> reported output tokens</span><span><strong>{progress.processing_batches || 0}</strong> processing</span><span><strong>{progress.pending_batches || 0}</strong> pending</span><span><strong>{progress.split_batches || 0}</strong> split</span><span><strong>{progress.retrying_batches || 0}</strong> retrying</span><span><strong>{progress.failed_batches || 0}</strong> failed</span></div>
-            {analysis.unknown_usage_requests > 0 && <p className="analysis-usage-note">The provider returned no usage totals for {analysis.unknown_usage_requests} request attempts. Reported totals above include only calls that returned usage metadata.</p>}
+            <div className="analysis-status-top"><div><span className="section-kicker">ANALYSIS STATUS</span><h2>{statusLabel}</h2></div><span className={`analysis-status-badge ${analysis.status}`}>{statusLabel}</span></div>
+            {progress.total_batches > 0 && <><div className="analysis-progress-label"><span>{progress.workflow_completed_batches} complete · {progress.processing_batches} processing · {progress.pending_batches + progress.retrying_batches + progress.failed_batches + progress.manual_review_batches} remaining{progress.retrying_batches ? ` · ${progress.retrying_batches} retrying` : ""}</span><span>{workflowPercentage}%</span></div><div className="analysis-progress-track"><span style={{ width: `${workflowPercentage}%` }} /></div><p className="analysis-usage-note">AI coverage: {Math.round((analysis.coverage?.text_coverage_ratio || 0) * 100)}% of extracted readable text analyzed.</p></>}
             {analysis.processing_started_at && <p className="analysis-usage-note">Run started {new Date(analysis.processing_started_at).toLocaleString()}{analysis.processing_finished_at ? ` · finished ${new Date(analysis.processing_finished_at).toLocaleString()}` : ""}</p>}
           </section>
           {analysis.status === "paused_rate_limit" && <div className="tender-notice info" role="status">{analysis.pause_reason === "daily_quota" ? `Paused by daily quota exhaustion${analysis.pause_until ? ` until ${new Date(analysis.pause_until).toLocaleString()}` : ""}.` : formatRateLimitPause(analysis.pause_until, analysis.retry_after_seconds)} Resume the current run after the cooldown.</div>}
           {analysisIncomplete && <div className="tender-notice info" role="status">This analysis is incomplete. Findings below come only from completed batches and may not cover the entire tender.</div>}
           {analysis && progress.total_batches > 0 && progress.completed_batches === 0 && <div className="tender-notice info" role="status">No batch has completed yet. Any preliminary findings are not a completed analysis.</div>}
-          {analysis.coverage && <section className={`analysis-coverage ${analysis.coverage.complete ? "good" : "review"}`}><div><strong>Text coverage: {Math.round((analysis.coverage.ratio || 0) * 100)}%</strong><span>{analysis.coverage.selected_pages} of {analysis.coverage.pages_with_text} text-bearing pages sent for analysis ({analysis.coverage.total_pages} PDF pages total); {analysis.coverage.unexamined_pages} text-bearing pages not sent.</span></div>{!analysis.coverage.complete && <p>Coverage is partial. Treat findings as incomplete and review the listed unexamined pages.</p>}</section>}
-          {(analysis.error_message || analysis.mongo_diagnostic || analysis.batch_diagnostic || analysis.provider_diagnostic) && <div className="analysis-error-detail">
-            <div>{analysis.error_message || "Analysis failed."}</div>
-            {(analysis.mongo_diagnostic || analysis.batch_diagnostic) && <div>
-              {analysis.mongo_diagnostic && <div>Database operation: {analysis.mongo_diagnostic.operation} · {analysis.mongo_diagnostic.exception_type}: {analysis.mongo_diagnostic.exception_message}</div>}
-              {!analysis.mongo_diagnostic && analysis.batch_diagnostic && <div>Batch operation: {analysis.batch_diagnostic.operation} · {analysis.batch_diagnostic.exception_type}: {analysis.batch_diagnostic.exception_message}</div>}
-            </div>}
-            {analysis.provider_diagnostic && <div>
-              Provider response: HTTP {analysis.provider_diagnostic.status_code || "unknown"}
-              {analysis.provider_diagnostic.provider_code ? ` · ${analysis.provider_diagnostic.provider_code}` : ""}
-              {analysis.provider_diagnostic.provider_message ? ` · ${analysis.provider_diagnostic.provider_message}` : ""}
-              {analysis.provider_diagnostic.retry_after_seconds !== null
-                ? ` · retry after ${analysis.provider_diagnostic.retry_after_seconds}s`
-                : ""}
-            </div>}
-          </div>}
+          {analysis.coverage && <section className={`analysis-coverage ${analysis.coverage.complete ? "good" : "review"}`}><div><strong>AI coverage: {Math.round((analysis.coverage.text_coverage_ratio || 0) * 100)}%</strong><span>{analysis.coverage.selected_pages} of {analysis.coverage.pages_with_text} text-bearing pages fully analyzed ({analysis.coverage.total_pages} PDF pages total); {analysis.coverage.unexamined_pages} text-bearing pages remain incomplete.</span></div>{!analysis.coverage.complete && <p>Coverage is partial. Treat findings as incomplete and review the listed unexamined pages.</p>}</section>}
+          {(analysis.error_message || analysis.mongo_diagnostic || analysis.batch_diagnostic || analysis.provider_diagnostic) && <div className="analysis-error-detail" role="status">{analysis.status === "failed" ? "Analysis needs attention. You can resume processing." : analysis.status === "paused_rate_limit" ? "Analysis is paused and can be resumed when provider capacity is available." : analysis.status === "completed_with_warnings" || analysis.status === "needs_review" ? "Analysis is ready with some items or source text to review." : "Analysis is processing."}</div>}
           <OverviewFields fields={analysis.overview_fields} />
           {analysis.overview && !Object.keys(analysis.overview_fields || {}).length && <section className="analysis-overview"><span className="section-kicker">TENDER OVERVIEW</span><p>{analysis.overview}</p></section>}
           {analysis.coverage?.unexamined_page_numbers?.length > 0 && <details className="analysis-unexamined"><summary>Unexamined page numbers</summary><p>{analysis.coverage.unexamined_page_numbers.join(", ")}{analysis.coverage.unexamined_pages > analysis.coverage.unexamined_page_numbers.length ? " …" : ""}</p></details>}

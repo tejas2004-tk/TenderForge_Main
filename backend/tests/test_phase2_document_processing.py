@@ -300,6 +300,27 @@ class Phase2DocumentProcessingTests(unittest.TestCase):
         self.assertEqual(summary.status, "needs_ocr")
         self.assertIn("OCR", summary.error_message)
 
+    def test_04c_local_pymupdf_ocr_text_makes_scanned_page_processable(self):
+        class FakeScannedPage:
+            rect = fitz.Rect(0, 0, 600, 800)
+
+            def get_text(self, kind, textpage=None):
+                return "" if textpage is None else (
+                    "Tender OCR result: bidder shall submit a certificate and turnover proof. " * 2
+                )
+
+            def get_image_info(self):
+                return [{"bbox": (0, 0, 600, 800)}]
+
+            def get_textpage_ocr(self, **_kwargs):
+                return object()
+
+        text, info = inspect_pdf_page(FakeScannedPage(), 1)
+        summary = assess_document_ocr_status(1, [info])
+        self.assertIn("bidder shall submit", text)
+        self.assertTrue(info.ocr_applied)
+        self.assertEqual(summary.status, "completed")
+
     # 5. Repeated headers and footers
     def test_05_repeated_headers_and_footers(self):
         page_lines = [

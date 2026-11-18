@@ -1,7 +1,9 @@
 """Isolated Phase 6 tests. All Gemini and collection interactions are mocked."""
 import sys
 import json
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -11,7 +13,7 @@ from unittest.mock import Mock, patch
 import httpx
 from flask import Flask
 from google.genai import errors as genai_errors
-from pymongo.errors import OperationFailure
+from pymongo.errors import DuplicateKeyError, OperationFailure
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from services import tender_analysis_service as service
@@ -22,6 +24,8 @@ class MemoryCollection:
     def __init__(self, rows=()):
         self.rows = [dict(row) for row in rows]
         self.updates = []
+        self.lock = threading.RLock()
+        self.enforce_batch_unique = False
 
     class Cursor(list):
         def sort(self, key, direction=1):
@@ -78,29 +82,37 @@ class MemoryCollection:
         return rows[0] if rows else None
 
     def find_one_and_update(self, query, update, return_document=None, sort=None, **kwargs):
-        candidates = [row for row in self.rows if self._matches(row, query)]
-        if sort:
-            for field, order in reversed(sort):
-                candidates.sort(key=lambda r: (r.get(field) is None, r.get(field)), reverse=order < 0)
-        row = candidates[0] if candidates else None
-        if row is not None:
-            self._apply(row, update)
-            return row
-        return None
+        with self.lock:
+            candidates = [row for row in self.rows if self._matches(row, query)]
+            if sort:
+                for field, order in reversed(sort):
+                    candidates.sort(key=lambda r: (r.get(field) is None, r.get(field)), reverse=order < 0)
+            row = candidates[0] if candidates else None
+            if row is not None:
+                self._apply(row, update)
+                return row
+            return None
 
     def count_documents(self, query):
         return sum(self._matches(row, query) for row in self.rows)
 
     def update_one(self, query, update, upsert=False):
-        self.updates.append((query, update))
-        row = next((row for row in self.rows if self._matches(row, query)), None)
-        if row is None and upsert:
-            row = dict(query)
-            row.update(update.get("$setOnInsert", {}))
-            self.rows.append(row)
-        if row is not None:
-            self._apply(row, update)
-        return SimpleNamespace(matched_count=int(row is not None))
+        with self.lock:
+            self.updates.append((query, update))
+            row = next((row for row in self.rows if self._matches(row, query)), None)
+            if row is None and upsert:
+                row = dict(query)
+                row.update(update.get("$setOnInsert", {}))
+                if self.enforce_batch_unique and any(
+                    saved.get("analysis_id") == row.get("analysis_id")
+                    and saved.get("batch_index") == row.get("batch_index")
+                    for saved in self.rows
+                ):
+                    raise DuplicateKeyError("duplicate analysis_id + batch_index")
+                self.rows.append(row)
+            if row is not None:
+                self._apply(row, update)
+            return SimpleNamespace(matched_count=int(row is not None))
 
     def update_many(self, query, update):
         for row in self.rows:
@@ -126,6 +138,8 @@ class MemoryCollection:
             row[key] = value
         for key, value in update.get("$inc", {}).items():
             row[key] = row.get(key, 0) + value
+        for key, value in update.get("$max", {}).items():
+            row[key] = max(row.get(key, value), value)
         for key, value in update.get("$addToSet", {}).items():
             values = value.get("$each", [value]) if isinstance(value, dict) else [value]
             row.setdefault(key, [])
@@ -145,7 +159,7 @@ class Phase6AnalysisTests(unittest.TestCase):
             GEMINI_API_KEY="mock-key", GEMINI_MODEL="mock-model",
             ANALYSIS_MAX_INPUT_TOKENS=6000, ANALYSIS_MAX_OUTPUT_TOKENS=1400,
             ANALYSIS_RETRY_ATTEMPTS=3, ANALYSIS_RETRY_BASE_SECONDS=2,
-            ANALYSIS_REQUEST_INTERVAL_SECONDS=0,
+            ANALYSIS_REQUEST_INTERVAL_SECONDS=0, ANALYSIS_MAX_CONCURRENT_REQUESTS=1,
         )
         self.context = self.app.app_context()
         self.context.push()
@@ -244,12 +258,12 @@ class Phase6AnalysisTests(unittest.TestCase):
             "ANALYSIS_MAX_OUTPUT_TOKENS": 4000, "ANALYSIS_MAX_TPM_TOKENS": 8000,
         }):
             requested = service._request_output_budget({"estimated_output_tokens": 100})
-            self.assertEqual(requested, 2400)
+            self.assertEqual(requested, 1400)
             split_requested = service._request_output_budget(
                 {"estimated_output_tokens": 100, "subdivision_depth": 1}
             )
             self.assertLess(split_requested, requested)
-            self.assertEqual(service._tpm_output_budget(5893, requested), 2107)
+            self.assertEqual(service._tpm_output_budget(5893, requested), 1400)
 
     def test_timeout_is_retried_with_bounded_backoff(self):
         fake_client = Mock()
@@ -473,6 +487,29 @@ class Phase6AnalysisTests(unittest.TestCase):
         )) as groq, patch.object(service, "request_openrouter", return_value=good) as router:
             service._provider_request([{"role": "user", "content": "prompt"}], analysis, batch,
                                      MemoryCollection([analysis]), MemoryCollection([batch]), "lease")
+        groq.assert_called_once()
+        router.assert_called_once()
+
+    def test_invalid_json_falls_back_for_only_the_affected_chunk(self):
+        analysis = {"_id": "a", "processing_token": "lease", "provider_order": ["groq", "openrouter"],
+                    "provider_models": {"groq": "g-model", "openrouter": "o-model"}}
+        batch = {"_id": "b", "attempt_count": 0, "prompt_version": service.PROMPT_VERSION,
+                 "estimated_output_tokens": 500}
+        invalid = SimpleNamespace(provider="groq", model="g-model", content="not json",
+                                  finish_reason="stop", input_tokens=10, output_tokens=20,
+                                  total_tokens=30, latency_ms=1, http_status=200, request_id="bad")
+        valid = SimpleNamespace(provider="openrouter", model="o-model",
+                                content='{"overview":{},"requirements":[]}', finish_reason="stop",
+                                input_tokens=10, output_tokens=20, total_tokens=30,
+                                latency_ms=1, http_status=200, request_id="good")
+        with patch.dict(service.current_app.config, {
+            "GROQ_API_KEY": "g", "OPENROUTER_API_KEY": "o",
+            "ANALYSIS_MAX_OUTPUT_TOKENS": 400, "ANALYSIS_MAX_TPM_TOKENS": 800,
+        }), patch.object(service, "request_groq", return_value=invalid) as groq, \
+             patch.object(service, "request_openrouter", return_value=valid) as router:
+            result = service._provider_request([{"role": "user", "content": "prompt"}], analysis, batch,
+                                               MemoryCollection([analysis]), MemoryCollection([batch]), "lease")
+        self.assertIn('"requirements":[]', service._response_text(result[0]))
         groq.assert_called_once()
         router.assert_called_once()
 
@@ -785,7 +822,8 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual({tuple((ref["chunk_index"], ref["page_number"]) for ref in child["chunk_refs"]) for child in children},
                          {((1, 1),), ((2, 2),)})
         self.assertTrue(all(child["user_id"] == "user" and child["tender_id"] == "tender" and child["file_hash"] == "hash" for child in children))
-        self.assertTrue(all(child["is_overview_batch"] and child["prompt_version"] == "5" for child in children))
+        self.assertTrue(all(child["is_overview_batch"] and child["prompt_version"] == service.PROMPT_VERSION for child in children))
+        self.assertGreater(analysis["analysis_work_policy"]["adaptive_max_source_chars"], 0)
         self.assertEqual(untouched_pending["status"], "pending")
         self.assertEqual(analyses.rows[0]["actual_output_tokens"], 1400)
         self.assertEqual(requirements.rows, [])
@@ -813,7 +851,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertNotIn("SOURCE PAGE 1", sent)
         self.assertEqual(batches.rows[0]["status"], "split")
         self.assertEqual(batches.rows[1]["status"], "completed")
-        self.assertEqual(batches.rows[1]["prompt_version"], "5")
+        self.assertEqual(batches.rows[1]["prompt_version"], service.PROMPT_VERSION)
         self.assertFalse(batches.rows[1]["is_overview_batch"])
 
     def test_resume_subdivides_manual_child_and_preserves_completed_findings(self):
@@ -905,7 +943,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         chunks.rows.append({"chunk_index": 2, "page_number": 2, "text": "Second page text.",
                             "user_id": "user", "tender_id": "tender", "file_hash": "hash"})
         pages.rows.append({"page_number": 2, "part_index": 0, "complete": True, "text": "Second page text."})
-        service._split_truncated_batch(batches.rows[0], batches)
+        service._split_truncated_batch(batches.rows[0], batches, analyses=analyses)
         children = [row for row in batches.rows if row.get("parent_batch_id") == "batch"]
         self.assertTrue(all(row["is_overview_batch"] and row["prompt_version"] == "5" for row in children))
         with patch.object(service.genai, "Client", return_value=client), patch.object(service, "_pace"), \
@@ -967,6 +1005,43 @@ class Phase6AnalysisTests(unittest.TestCase):
             self.assertTrue(all(item[2] == item[0] and item[3] == item[1] for item in ranges))
         self.assertFalse(any(ref["page_number"] == 3 for row in batches.rows for ref in row.get("chunk_refs", [])))
 
+    def test_five_text_pages_are_all_enqueued_as_ai_work(self):
+        analysis = {"_id": "five-pages", "user_id": "user", "tender_id": "tender", "file_hash": "hash",
+                    "provider_policy_version": 1}
+        page_texts = {page: f"Page {page}: bidder shall submit certificate and comply with condition {page}."
+                      for page in range(1, 6)}
+        chunks = MemoryCollection([
+            {"user_id": "user", "tender_id": "tender", "file_hash": "hash",
+             "chunk_index": page, "page_number": page,
+             "text": text, "char_start": 0, "char_end": len(text)}
+            for page, text in page_texts.items()
+        ])
+        batches = MemoryCollection()
+        total, _ = service._plan_batches(analysis, batches, chunks, page_count=5)
+        enqueued_pages = {ref["page_number"] for batch in batches.rows for ref in batch.get("chunk_refs", [])}
+        self.assertGreater(total, 0)
+        self.assertEqual(enqueued_pages, {1, 2, 3, 4, 5})
+        pages = MemoryCollection([{"user_id": "user", "tender_id": "tender", "file_hash": "hash",
+                                   "page_number": page, "part_index": 0, "complete": True, "text": text}
+                                  for page, text in page_texts.items()])
+        response = SimpleNamespace(text='{"overview": {}, "requirements": []}',
+                                    candidates=[SimpleNamespace(finish_reason="STOP")],
+                                    usage_metadata=SimpleNamespace())
+        analyses = MemoryCollection([dict(analysis, processing_token="lease")])
+        captured = []
+        def provider(messages, *_args):
+            captured.append(messages[1]["content"])
+            return response, 200, 100, 100, None, 200, 1
+        with patch.object(service, "_provider_request", side_effect=provider), \
+                patch.object(service, "_save_requirements", return_value=0), \
+                patch.object(service, "_validated_overview_fields", return_value={}):
+            for _ in range(total):
+                self.assertTrue(service._process_batch(analyses.rows[0], "lease", analyses, batches,
+                                                       MemoryCollection(), pages, chunks))
+        sent_pages = {page for content in captured for page in range(1, 6)
+                      if f"[SOURCE PAGE {page}" in content}
+        self.assertEqual(sent_pages, {1, 2, 3, 4, 5})
+
     def test_batch_claim_honors_retry_deadline_and_terminal_provider_failure(self):
         now = service._now()
         analysis = {"_id": "analysis", "provider_policy_version": 1,
@@ -999,6 +1074,88 @@ class Phase6AnalysisTests(unittest.TestCase):
             service._advance(analyses.rows[0], analyses, batches, MemoryCollection(), MemoryCollection(), MemoryCollection())
         self.assertEqual(process.call_count, 3)
 
+    def test_advance_processes_independent_chunks_with_bounded_concurrency(self):
+        analysis = {"_id": "parallel", "user_id": "user", "tender_id": "tender",
+                    "file_hash": "hash", "status": "pending", "plan_ready": True,
+                    "total_batches": 3, "lease_until": None}
+        analyses = MemoryCollection([dict(analysis)])
+        batches = MemoryCollection()
+        gate = threading.Barrier(3)
+        guard = threading.Lock()
+        state = {"calls": 0, "active": 0, "max_active": 0}
+
+        def process(*_args):
+            with guard:
+                state["calls"] += 1
+                call = state["calls"]
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                if call <= 3:
+                    gate.wait(timeout=3)
+                    return True
+                return False
+            finally:
+                with guard:
+                    state["active"] -= 1
+
+        with patch.dict(service.current_app.config, {"ANALYSIS_MAX_CONCURRENT_REQUESTS": 3}), \
+                patch.object(service, "_process_batch", side_effect=process), \
+                patch.object(service, "_refresh_counts"):
+            service._advance(analyses.rows[0], analyses, batches, MemoryCollection(),
+                            MemoryCollection(), MemoryCollection())
+        self.assertEqual(state["max_active"], 3)
+        self.assertEqual(state["calls"], 6)
+
+    def test_parallel_chunk_failure_does_not_stop_other_workers(self):
+        analysis = {"_id": "parallel-failure", "user_id": "user", "tender_id": "tender",
+                    "file_hash": "hash", "status": "pending", "plan_ready": True,
+                    "total_batches": 3, "lease_until": None}
+        analyses = MemoryCollection([dict(analysis)])
+        gate = threading.Barrier(3)
+        guard = threading.Lock()
+        calls = {"count": 0}
+
+        def process(*_args):
+            with guard:
+                calls["count"] += 1
+                call = calls["count"]
+            if call <= 3:
+                gate.wait(timeout=3)
+                if call == 1:
+                    raise service.AnalysisError("one independent chunk failed", 502)
+                return True
+            return False
+
+        with patch.dict(service.current_app.config, {"ANALYSIS_MAX_CONCURRENT_REQUESTS": 3}), \
+                patch.object(service, "_process_batch", side_effect=process), \
+                patch.object(service, "_refresh_counts"):
+            service._advance(analyses.rows[0], analyses, MemoryCollection(), MemoryCollection(),
+                             MemoryCollection(), MemoryCollection())
+        self.assertEqual(calls["count"], 5)
+
+    def test_parallel_finding_persistence_serializes_duplicate_merges(self):
+        guard = threading.Lock()
+        state = {"active": 0, "max_active": 0, "calls": 0}
+
+        def persist(*_args, **_kwargs):
+            with guard:
+                state["calls"] += 1
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            threading.Event().wait(0.02)
+            with guard:
+                state["active"] -= 1
+            return 0
+
+        with patch.object(service, "_save_requirements_unlocked", side_effect=persist):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(service._save_requirements, [], {}, {}, None, None)
+                           for _ in range(2)]
+                self.assertEqual([future.result() for future in futures], [0, 0])
+        self.assertEqual(state["calls"], 2)
+        self.assertEqual(state["max_active"], 1)
+
     def _fresh_run_collections(self, status="needs_review"):
         user_id, tender_id, file_hash = "user", "tender", "hash"
         old_created = service._now() - service.timedelta(days=1)
@@ -1026,16 +1183,16 @@ class Phase6AnalysisTests(unittest.TestCase):
         with patch.object(service, "_find_owned_tender", return_value=tender), \
                 patch.object(service, "_ready_extraction", return_value={"page_count": 11, "extracted_pages": 11}), \
                 patch.object(service, "_collections", return_value=collections), \
-                patch.object(service, "_advance", return_value={"status": "processing", "analysis_version": "7"}) as advance:
+                patch.object(service, "_advance", return_value={"status": "processing", "analysis_version": "8"}) as advance:
             first, started = service.start_fresh_analysis(user, "tender", request_id="fresh-request-1")
             second, duplicate_started = service.start_fresh_analysis(user, "tender", request_id="fresh-request-1")
         self.assertTrue(started)
         self.assertFalse(duplicate_started)
-        self.assertEqual(first["analysis_version"], "7")
-        self.assertEqual(second["analysis_version"], "7")
+        self.assertEqual(first["analysis_version"], "8")
+        self.assertEqual(second["analysis_version"], "8")
         self.assertEqual(analyses.rows[0]["status"], "needs_review")
-        self.assertEqual(analyses.rows[1]["analysis_logic_version"], "6")
-        self.assertEqual(analyses.rows[1]["prompt_version"], "5")
+        self.assertEqual(analyses.rows[1]["analysis_logic_version"], service.ANALYSIS_VERSION)
+        self.assertEqual(analyses.rows[1]["prompt_version"], service.PROMPT_VERSION)
         self.assertEqual(analyses.rows[1]["run_origin"], "fresh")
         self.assertNotEqual(analyses.rows[0]["_id"], analyses.rows[1]["_id"])
         self.assertEqual(requirements.rows[0]["analysis_id"], "old-run")
@@ -1062,18 +1219,18 @@ class Phase6AnalysisTests(unittest.TestCase):
         user = {"_id": "user"}
         tender = {"_id": "tender", "sha256": "hash"}
         collections = self._fresh_run_collections()
-        latest = dict(collections[0].rows[0], _id="fresh-run", analysis_version="6",
-                      analysis_logic_version="5", run_origin="fresh", status="paused_rate_limit")
+        latest = dict(collections[0].rows[0], _id="fresh-run", analysis_version="7",
+                      analysis_logic_version="7", run_origin="fresh", status="paused_rate_limit")
         collections[0].rows.append(latest)
         with patch.object(service, "_find_owned_tender", return_value=tender), \
                 patch.object(service, "_ready_extraction", return_value={"page_count": 11, "extracted_pages": 11}), \
                 patch.object(service, "_collections", return_value=collections), \
-                patch.object(service, "_advance", return_value={"status": "paused_rate_limit", "analysis_version": "6"}) as advance:
+                patch.object(service, "_advance", return_value={"status": "paused_rate_limit", "analysis_version": "7"}) as advance:
             started, created = service.start_analysis(user, "tender")
             resumed = service.resume_analysis(user, "tender")
         self.assertFalse(created)
-        self.assertEqual(started["analysis_version"], "6")
-        self.assertEqual(resumed["analysis_version"], "6")
+        self.assertEqual(started["analysis_version"], "7")
+        self.assertEqual(resumed["analysis_version"], "7")
         self.assertEqual(advance.call_count, 1)
         self.assertEqual(advance.call_args.args[0]["_id"], "fresh-run")
 
@@ -1082,15 +1239,33 @@ class Phase6AnalysisTests(unittest.TestCase):
                  "file_hash": "hash", "batch_index": 0, "chunk_refs": [{"chunk_index": 1, "page_number": 1}],
                  "status": "split_pending"}
         batches = MemoryCollection([batch])
+        analyses = MemoryCollection([{"_id": "analysis"}])
         chunks = MemoryCollection([{"chunk_index": 1, "page_number": 1, "text": "0123456789",
                                     "user_id": "user", "tender_id": "tender", "file_hash": "hash"}])
         batch["analysis_work_policy"] = {"max_split_depth": 2, "min_segment_chars": 1}
-        self.assertEqual(service._split_truncated_batch(batch, batches, chunks), 2)
-        self.assertEqual(service._split_truncated_batch(batches.rows[0], batches, chunks), 2)
+        batches.rows[0]["analysis_work_policy"] = batch["analysis_work_policy"]
+        self.assertEqual(service._split_truncated_batch(batch, batches, chunks, analyses), 2)
+        self.assertEqual(service._split_truncated_batch(batches.rows[0], batches, chunks, analyses), 2)
         self.assertEqual(len(batches.rows), 3)
         self.assertEqual(batches.rows[0]["status"], "split")
         self.assertEqual(sorted((row["chunk_refs"][0]["text_start"], row["chunk_refs"][0]["text_end"])
                                 for row in batches.rows[1:]), [(0, 5), (5, 10)])
+
+    def test_truncation_remains_recoverable_past_the_old_two_level_limit(self):
+        text = "Requirement text. " * 300
+        batch = {"_id": "deep-parent", "analysis_id": "analysis", "user_id": "user",
+                 "tender_id": "tender", "file_hash": "hash", "batch_index": 0,
+                 "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 0,
+                                 "text_end": len(text)}], "status": "split_pending",
+                 "subdivision_depth": 2, "analysis_work_policy": {"max_split_depth": 5,
+                                                                      "min_segment_chars": 120}}
+        batches = MemoryCollection([batch])
+        analyses = MemoryCollection([{"_id": "analysis"}])
+        chunks = MemoryCollection([{"chunk_index": 1, "page_number": 1, "text": text,
+                                    "user_id": "user", "tender_id": "tender", "file_hash": "hash"}])
+        self.assertEqual(service._split_truncated_batch(batch, batches, chunks, analyses), 2)
+        self.assertEqual(batches.rows[0]["status"], "split")
+        self.assertEqual({row["subdivision_depth"] for row in batches.rows if row.get("parent_batch_id")}, {3})
 
     def test_single_reference_subdivision_is_bounded_to_two_child_levels(self):
         text = "x" * 1024
@@ -1100,19 +1275,20 @@ class Phase6AnalysisTests(unittest.TestCase):
                  "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 0, "text_end": len(text),
                                  "source_start": 500, "source_end": 500 + len(text)}]}
         batches = MemoryCollection([batch])
+        analyses = MemoryCollection([{"_id": "analysis"}])
         chunks = MemoryCollection([{"chunk_index": 1, "page_number": 1, "text": text, "char_start": 500,
                                     "user_id": "user", "tender_id": "tender", "file_hash": "hash"}])
-        service._split_truncated_batch(batches.rows[0], batches, chunks)
+        service._split_truncated_batch(batches.rows[0], batches, chunks, analyses)
         level_one = [row for row in batches.rows if row.get("parent_batch_id") == "root"]
         self.assertEqual(len(level_one), 2)
         for child in level_one:
-            service._split_truncated_batch(child, batches, chunks)
+            service._split_truncated_batch(child, batches, chunks, analyses)
         level_two = [row for row in batches.rows if row.get("parent_batch_id") in {row["_id"] for row in level_one}]
         self.assertEqual(len(level_two), 4)
         ranges = []
         for leaf in level_two:
             self.assertEqual(leaf["subdivision_depth"], 2)
-            service._split_truncated_batch(leaf, batches, chunks)
+            service._split_truncated_batch(leaf, batches, chunks, analyses)
             self.assertEqual(leaf["status"], "skipped")
             ref = leaf["chunk_refs"][0]
             ranges.append((ref["text_start"], ref["text_end"]))
@@ -1123,13 +1299,62 @@ class Phase6AnalysisTests(unittest.TestCase):
                  "file_hash": "h1", "batch_index": 0, "chunk_refs": [{"chunk_index": 7, "page_number": 2}],
                  "status": "split_pending", "analysis_work_policy": {"max_split_depth": 2, "min_segment_chars": 1}}
         batches = MemoryCollection([batch])
+        analyses = MemoryCollection([{"_id": "analysis"}])
         chunks = MemoryCollection([
             {"chunk_index": 7, "page_number": 2, "text": "abcdefghij", "user_id": "u1", "tender_id": "t1", "file_hash": "h1"},
             {"chunk_index": 7, "page_number": 2, "text": "x" * 100, "user_id": "u2", "tender_id": "t2", "file_hash": "h2"},
         ])
-        service._split_truncated_batch(batch, batches, chunks)
+        service._split_truncated_batch(batch, batches, chunks, analyses)
         children = [row for row in batches.rows if row.get("parent_batch_id") == "scoped"]
         self.assertEqual(sorted(ref["text_end"] for row in children for ref in row["chunk_refs"]), [5, 10])
+
+    def test_concurrent_splits_reserve_unique_indexes_and_same_parent_is_idempotent(self):
+        parents = [{"_id": f"parent-{i}", "analysis_id": "analysis", "user_id": "user",
+                    "tender_id": "tender", "file_hash": "hash", "batch_index": i,
+                    "status": "split_pending", "chunk_refs": [
+                        {"chunk_index": i * 2 + 1, "page_number": i * 2 + 1},
+                        {"chunk_index": i * 2 + 2, "page_number": i * 2 + 2},
+                    ]} for i in range(2)]
+        batches = MemoryCollection(parents)
+        batches.enforce_batch_unique = True
+        analyses = MemoryCollection([{"_id": "analysis"}])
+        chunks = MemoryCollection([{"chunk_index": i, "page_number": i, "text": f"page {i}",
+                                    "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
+                                   for i in range(1, 5)])
+        def split(parent):
+            with self.app.app_context():
+                return service._split_truncated_batch(parent, batches, chunks, analyses)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(split, [parents[0], parents[1]] * 4))
+        indexes = [row["batch_index"] for row in batches.rows]
+        self.assertEqual(len(indexes), len(set(indexes)))
+        for parent in parents:
+            children = [row for row in batches.rows if row.get("parent_batch_id") == parent["_id"]]
+            self.assertEqual(len(children), 2)
+            self.assertEqual(batches.find_one({"_id": parent["_id"]})["status"], "split")
+
+    def test_resume_recovers_partial_split_without_duplicate_children_or_findings(self):
+        parent = {"_id": "resume-parent", "analysis_id": "analysis", "user_id": "user",
+                  "tender_id": "tender", "file_hash": "hash", "batch_index": 0,
+                  "status": "split_pending", "chunk_refs": [
+                      {"chunk_index": 1, "page_number": 1}, {"chunk_index": 2, "page_number": 2}],
+                  "findings_persisted": True, "split_plan": [
+                      {"_id": "existing-child", "batch_index": 8,
+                       "chunk_refs": [{"chunk_index": 1, "page_number": 1}]},
+                      {"_id": "missing-child", "batch_index": 9,
+                       "chunk_refs": [{"chunk_index": 2, "page_number": 2}]},
+                  ]}
+        child = {"_id": "existing-child", "analysis_id": "analysis", "parent_batch_id": "resume-parent",
+                 "batch_index": 8, "status": "completed", "findings": ["kept"]}
+        batches = MemoryCollection([parent, child])
+        batches.enforce_batch_unique = True
+        analyses = MemoryCollection([{"_id": "analysis", "next_batch_index": 10}])
+        self.assertEqual(service._split_truncated_batch(parent, batches, analyses=analyses), 2)
+        self.assertEqual(service._split_truncated_batch(parent, batches, analyses=analyses), 2)
+        children = [row for row in batches.rows if row.get("parent_batch_id") == "resume-parent"]
+        self.assertEqual(len(children), 2)
+        self.assertEqual(batches.find_one({"_id": "existing-child"})["findings"], ["kept"])
+        self.assertEqual(len([row for row in batches.rows if row.get("_id") == "missing-child"]), 1)
 
     def test_out_of_range_saved_segment_is_skipped_without_provider_call(self):
         analysis = {"_id": "analysis", "user_id": "user", "tender_id": "tender", "file_hash": "hash"}
@@ -1153,7 +1378,8 @@ class Phase6AnalysisTests(unittest.TestCase):
                  "chunk_refs": [{"chunk_index": 1, "page_number": 1, "text_start": 0, "text_end": 2}],
                  "status": "split_pending"}
         batches = MemoryCollection([batch])
-        self.assertEqual(service._split_truncated_batch(batch, batches), 0)
+        analyses = MemoryCollection([{"_id": "analysis"}])
+        self.assertEqual(service._split_truncated_batch(batch, batches, analyses=analyses), 0)
         self.assertEqual(batches.rows[0]["status"], "skipped")
         self.assertEqual(batches.rows[0]["skipped_text_ranges"][0]["text_end"], 2)
 
@@ -1210,7 +1436,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         self.assertEqual(saved["unknown_usage_requests"], 1)
         self.assertEqual(saved["actual_input_tokens"], 44)
         self.assertEqual(saved["actual_output_tokens"], 12)
-        self.assertEqual(saved["prompt_versions_used"], ["5"])
+        self.assertEqual(saved["prompt_versions_used"], [service.PROMPT_VERSION])
 
     def test_evidence_requires_contiguous_text_unless_ellipsis_is_explicit(self):
         source = "THE bidder shall, SUBMIT its valid certificate."
@@ -1745,6 +1971,7 @@ class Phase6AnalysisTests(unittest.TestCase):
         live = service._batch_progress("analysis", batches)
         self.assertEqual(live["total_batches"], 5)
         self.assertEqual(live["completed_batches"], 5)
+        self.assertEqual(live["workflow_completed_batches"], 5)
         self.assertEqual(live["split_batches"], 1)
 
     def test_all_pages_completed_and_saved_before_successful_completion(self):

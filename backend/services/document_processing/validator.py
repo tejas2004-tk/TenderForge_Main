@@ -41,6 +41,7 @@ class PageValidationInfo:
     has_image: bool
     is_empty: bool
     is_scanned: bool
+    ocr_applied: bool = False
 
 
 @dataclass
@@ -79,6 +80,21 @@ def inspect_pdf_page(page, page_number: int) -> tuple[str, PageValidationInfo]:
 
     is_empty = char_count == 0 and not has_page_image
     is_scanned = (char_count < LOW_TEXT_CHARACTER_LIMIT and has_page_image) or (char_count == 0 and has_page_image)
+    ocr_applied = False
+
+    # PyMuPDF delegates OCR to a locally installed Tesseract binary. Attempt
+    # it only for image-heavy pages; when Tesseract is unavailable, preserve
+    # the existing explicit needs_ocr outcome instead of failing extraction.
+    if is_scanned:
+        try:
+            text_page = page.get_textpage_ocr(language="eng", dpi=200, full=True)
+            ocr_text = page.get_text("text", textpage=text_page) or ""
+            if len(ocr_text.strip()) >= LOW_TEXT_CHARACTER_LIMIT:
+                raw_text = ocr_text
+                char_count = len(raw_text.strip())
+                ocr_applied = True
+        except Exception as exc:
+            _logger.info("Local OCR unavailable for page %s: %s", page_number, type(exc).__name__)
 
     info = PageValidationInfo(
         page_number=page_number,
@@ -86,6 +102,7 @@ def inspect_pdf_page(page, page_number: int) -> tuple[str, PageValidationInfo]:
         has_image=has_page_image,
         is_empty=is_empty,
         is_scanned=is_scanned,
+        ocr_applied=ocr_applied,
     )
     return raw_text, info
 
@@ -134,7 +151,7 @@ def assess_document_ocr_status(
 
     total_chars = sum(p.char_count for p in page_infos)
     empty_pages = sum(1 for p in page_infos if p.is_empty)
-    scanned_pages = sum(1 for p in page_infos if p.is_scanned)
+    scanned_pages = sum(1 for p in page_infos if p.is_scanned and not p.ocr_applied)
 
     # Any scanned page needs explicit OCR handling so its source text is not
     # silently omitted from an otherwise processable mixed document.

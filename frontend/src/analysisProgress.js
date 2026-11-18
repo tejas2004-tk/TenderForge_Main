@@ -3,6 +3,8 @@ export function normalizeProgress(value) {
   return {
     total_batches: Number(progress.total_batches) || 0,
     completed_batches: Number(progress.completed_batches) || 0,
+    workflow_completed_batches: Number(progress.workflow_completed_batches)
+      || Number(progress.completed_batches) || 0,
     processing_batches: Number(progress.processing_batches) || 0,
     pending_batches: Number(progress.pending_batches) || 0,
     manual_review_batches: Number(progress.manual_review_batches) || 0,
@@ -10,6 +12,13 @@ export function normalizeProgress(value) {
     retrying_batches: Number(progress.retrying_batches) || 0,
     failed_batches: Number(progress.failed_batches) || 0,
   };
+}
+
+export function acceptAnalysisUpdate(previous, incoming) {
+  if (!previous || !incoming || previous.id !== incoming.id) return incoming;
+  const terminal = new Set(["completed", "completed_with_warnings", "needs_review", "failed"]);
+  if (terminal.has(previous.status) && !terminal.has(incoming.status)) return previous;
+  return incoming;
 }
 
 export function formatRateLimitPause(pauseUntil, retryAfterSeconds) {

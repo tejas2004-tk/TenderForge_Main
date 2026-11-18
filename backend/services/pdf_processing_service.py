@@ -465,6 +465,7 @@ def process_tender(user, tender_id):
                         "part_count": part_count,
                         "text_character_count": character_count,
                         "has_page_image": info.has_image,
+                        "ocr_applied": info.ocr_applied,
                         "text": part,
                         "complete": True,
                     })
